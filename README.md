@@ -65,7 +65,8 @@ In an `http.serve` handler: `jwt.bearer_token(req)` reads `Authorization: Bearer
 |---|---|
 | `Alg` | `HS256`, `HS384`, `HS512`, `EdDSA` |
 | `alg_name(a)`, `alg_of(name)`, `all_algs()` | Header names (case-sensitive; `none` is not an algorithm) |
-| `Key` | `HmacKey`, `EdSigningKey` or `EdVerifyingKey`, each bound to one algorithm, with an optional `kid` (holds secrets, so no `Eq`/`Show`) |
+| `Key` | `HmacKey`, `EdSigningKey` or `EdVerifyingKey`, each bound to one algorithm, with an optional `kid`; derives `Eq` (structural, for tests) and `Show` (secrets print as `<secret>`) |
+| `KeyBytes` | The secret material inside a key (`new Secret[Bytes]`; constant-time `==`, shows as `<secret>`) |
 | `hmac_key(alg, secret)` | Checks the length: 32, 48 or 64 bytes at least |
 | `ed25519_signing_key(seed)`, `ed25519_verifying_key(x)` | From the 32-byte seed (JWK `d`) or public key (JWK `x`) |
 | `generate_hmac_key(alg)`, `generate_ed25519_key()` | Random keys (`! rand`) |
