@@ -1,0 +1,1163 @@
+// JSON Web Tokens (RFC 7519) as compact JWS (RFC 7515) with HS256, HS384, HS512 (RFC 7518) and
+// EdDSA over Ed25519 (RFC 8037), following the JWT best current practices of RFC 8725: keys are
+// typed and bound to one algorithm, the algorithm in a token's header only selects among the keys
+// and algorithms the caller allows, `none` is never accepted, unknown critical headers are
+// refused, and parsing is strict (canonical base64url, JSON objects without duplicate members,
+// a size limit). Claims are validated with a leeway against a time the caller passes in. Keys can
+// be read from and written as JWK sets (RFC 7517) for Ed25519 and symmetric keys.
+
+// ---------- errors ----------
+
+// Why a token, a key or a key set was refused.
+pub type JwtErr = Malformed{why: Str} | TooLarge{len: Int, max: Int} | UnsupportedAlg{alg: Str} | AlgNotAllowed{alg: Str} | UnknownCritical{name: Str} | NoKey{kid: Opt[Str]} | BadSignature | Expired{exp: Int, now: Int} | NotYetValid{nbf: Int, now: Int} | IssuedInFuture{iat: Int, now: Int} | IssuedTooLongAgo{iat: Int, max_age: Int} | WrongIssuer{iss: Opt[Str]} | WrongAudience{aud: List[Str]} | WrongSubject{sub: Opt[Str]} | WrongType{typ: Opt[Str]} | MissingClaim{name: Str} | BadClaim{name: Str, why: Str} | InvalidKey{why: Str} | BadJwks{why: Str} derive Eq, Show
+
+// ---------- SHA-384 and HMAC-SHA-384 ----------
+
+// The standard library has SHA-256 and SHA-512 but not SHA-384, which HS384 needs. SHA-384 is
+// SHA-512's compression function with other initial values, truncated to 48 bytes (FIPS 180-4).
+// The same code run with SHA-512's initial values is checked against crypto.sha512 in the tests,
+// and the constants against their definition (cube and square roots of primes, computed there
+// with BigInt).
+
+fn sha2_k() -> List[Int]
+= [4794697086780616226, 8158064640168781261, -5349999486874862801, -1606136188198331460, 4131703408338449720, 6480981068601479193, -7908458776815382629, -6116909921290321640, -2880145864133508542, 1334009975649890238, 2608012711638119052, 6128411473006802146, 8268148722764581231, -9160688886553864527, -7215885187991268811, -4495734319001033068, -1973867731355612462, -1171420211273849373, 1135362057144423861, 2597628984639134821, 3308224258029322869, 5365058923640841347, 6679025012923562964, 8573033837759648693, -7476448914759557205, -6327057829258317296, -5763719355590565569, -4658551843659510044, -4116276920077217854, -3051310485924567259, 489312712824947311, 1452737877330783856, 2861767655752347644, 3322285676063803686, 5560940570517711597, 5996557281743188959, 7280758554555802590, 8532644243296465576, -9096487096722542874, -7894198246740708037, -6719396339535248540, -6333637450476146687, -4446306890439682159, -4076793802049405392, -3345356375505022440, -2983346525034927856, -860691631967231958, 1182934255886127544, 1847814050463011016, 2177327727835720531, 2830643537854262169, 3796741975233480872, 4115178125766777443, 5681478168544905931, 6601373596472566643, 7507060721942968483, 8399075790359081724, 8693463985226723168, -8878714635349349518, -8302665154208450068, -8016688836872298968, -6606660893046293015, -4685533653050689259, -4147400797238176981, -3880063495543823972, -3348786107499101689, -1523767162380948706, -757361751448694408, 500013540394364858, 748580250866718886, 1242879168328830382, 1977374033974150939, 2944078676154940804, 3659926193048069267, 4368137639120453308, 4836135668995329356, 5532061633213252278, 6448918945643986474, 6902733635092675308, 7801388544844847127]
+
+fn sha512_iv() -> List[Int]
+= [7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935, 5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809]
+
+fn sha384_iv() -> List[Int]
+= [-3766243637369397544, 7105036623409894663, -7973340178411365097, 1526699215303891257, 7436329637833083697, -8163818279084223215, -2662702644619276377, 5167115440072839076]
+
+fn be64(bs: List[Int], at: Int) -> Int
+= (0..8).fold(0, (acc, j) => acc.shl(8).bor(bs[at + j]))
+
+fn padded(msg: Bytes) -> List[Int]
+= do
+  n = msg.len
+  zeros = (239 - n % 128) % 128
+  bits = n * 8
+  msg.to_list + [128] + (0..zeros).map(i => 0) + (0..16).map(i => if i < 8 then 0 else bits.shr(8 * (15 - i)).band(255))
+
+fn compress(hs: List[Int], w: List[Int], k: List[Int]) -> List[Int]
+= do
+  var a = hs[0]
+  var b = hs[1]
+  var c = hs[2]
+  var d = hs[3]
+  var e = hs[4]
+  var f = hs[5]
+  var g = hs[6]
+  var h = hs[7]
+  for t in 0..80
+    s1 = e.rotr(14).bxor(e.rotr(18)).bxor(e.rotr(41))
+    ch = e.band(f).bxor(e.bnot.band(g))
+    t1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(k[t]).wrapping_add(w[t])
+    s0 = a.rotr(28).bxor(a.rotr(34)).bxor(a.rotr(39))
+    maj = a.band(b).bxor(a.band(c)).bxor(b.band(c))
+    t2 = s0.wrapping_add(maj)
+    h := g
+    g := f
+    f := e
+    e := d.wrapping_add(t1)
+    d := c
+    c := b
+    b := a
+    a := t1.wrapping_add(t2)
+  [a, b, c, d, e, f, g, h].zip(hs).map(p => p.0.wrapping_add(p.1))
+
+fn schedule(bs: List[Int], at: Int) -> List[Int]
+= do
+  var w = (0..16).map(t => be64(bs, at + t * 8))
+  for t in 16..80
+    x = w[t - 15]
+    y = w[t - 2]
+    s0 = x.rotr(1).bxor(x.rotr(8)).bxor(x.shr(7))
+    s1 = y.rotr(19).bxor(y.rotr(61)).bxor(y.shr(6))
+    w := w.push(w[t - 16].wrapping_add(s0).wrapping_add(w[t - 7]).wrapping_add(s1))
+  w
+
+fn sha2_64(iv: List[Int], msg: Bytes) -> List[Int]
+= do
+  bs = padded(msg)
+  k = sha2_k()
+  var hs = iv
+  for blk in 0..bs.len / 128
+    hs := compress(hs, schedule(bs, blk * 128), k)
+  hs
+
+fn words_bytes(ws: List[Int]) -> Bytes
+= bytes(ws.flat_map(x => (0..8).map(j => x.shr(56 - 8 * j).band(255))))
+
+// SHA-512 computed by this package's own code, for checking it against crypto.sha512.
+fn sha512_here(msg: Bytes) -> Bytes
+= words_bytes(sha2_64(sha512_iv(), msg))
+
+// The SHA-384 digest (48 bytes) of `data`, FIPS 180-4.
+pub fn sha384(data: Bytes) -> Bytes
+  post r.len == 48
+= words_bytes(sha2_64(sha384_iv(), data).take(6))
+
+fn hmac384_raw(key: Bytes, data: Bytes) -> Bytes
+= do
+  k0 = if key.len > 128 then sha384(key) else key
+  kl = k0.to_list + (0..128 - k0.len).map(i => 0)
+  inner = sha384(bytes(kl.map(b => b.bxor(54))).concat(data))
+  sha384(bytes(kl.map(b => b.bxor(92))).concat(inner))
+
+// HMAC-SHA-384 (RFC 2104, RFC 4231) of `data` under `key`: 48 bytes.
+pub fn hmac_sha384(key: Secret[Bytes], data: Bytes) -> Bytes
+  post r.len == 48
+= key.map(k => hmac384_raw(k, data)).expose("an HMAC tag is public; the key stays secret")
+
+// ---------- JSON values ----------
+
+// A JSON value as parsed from a token, keeping the members of an object in their order and
+// numbers as their text (so nothing is lost or rounded).
+pub type JsonValue = JNull | JBool{value: Bool} | JNum{text: Str} | JStr{value: Str} | JArr{items: List[JsonValue]} | JObj{fields: List[(Str, JsonValue)]} derive Eq, Show
+
+fn token_regex() -> Res[Regex, Str]
+= regex("\"(?:[^\"\\\\]|\\\\.)*\"|-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null|[\{}\\[\\]:,]|[ \t\n\r]+")
+
+fn lex(s: Str) -> Res[List[Str], Str]
+= match token_regex()
+  | err(e) => err(e)
+  | ok(r) => do
+    ts = r.find_all(s)
+    if ts.join("") != s then err("invalid JSON text") else ok(ts.filter(t => not " \t\n\r".contains(t.first.or("x"))))
+
+fn hex_value(s: Str) -> Opt[Int]
+= if s.len == 4 and s.lower.chars.all(c => "0123456789abcdef".contains(c)) then some(s.lower.chars.fold(0, (n, c) => n * 16 + "0123456789abcdef".index_of(c).or(0))) else none
+
+type Mode = Plain | Escape | Unicode
+
+type Unesc = {out: StrBuf, mode: Mode, hex: Str, high: Int, bad: Str}
+
+fn fail_at(s: Unesc, why: Str) -> Unesc
+= s with bad := why
+
+fn emit(s: Unesc, cp: Int) -> Unesc
+= s with out := s.out.add(from_codes([cp]).or(""))
+
+fn simple_escape(c: Str) -> Opt[Str]
+= match c
+  | "\"" => some("\"")
+  | "\\" => some("\\")
+  | "/" => some("/")
+  | "b" => from_codes([8])
+  | "f" => from_codes([12])
+  | "n" => some("\n")
+  | "r" => some("\r")
+  | "t" => some("\t")
+  | _ => none
+
+fn code_point(s: Unesc, u: Int) -> Unesc
+= if u >= 55296 and u <= 56319 then (if s.high != 0 then fail_at(s, "unpaired surrogate") else s with high := u) else if u >= 56320 and u <= 57343 then (if s.high == 0 then fail_at(s, "unpaired surrogate") else emit(s with high := 0, 65536 + (s.high - 55296) * 1024 + (u - 56320))) else if s.high != 0 then fail_at(s, "unpaired surrogate") else emit(s, u)
+
+fn unicode_step(s: Unesc, hex: Str) -> Unesc
+= if hex.len < 4 then s with hex := hex else match hex_value(hex)
+  | none => fail_at(s, "bad \\u escape")
+  | some(u) => code_point(s with mode := Plain, hex := "", u)
+
+fn escape_step(s: Unesc, c: Str) -> Unesc
+= if c == "u" then s with mode := Unicode, hex := "" else if s.high != 0 then fail_at(s, "unpaired surrogate") else match simple_escape(c)
+  | some(x) => s with out := s.out.add(x)
+  | none => fail_at(s, "bad escape")
+
+fn plain_step(s: Unesc, c: Str) -> Unesc
+= if c == "\\" then s with mode := Escape else if s.high != 0 then fail_at(s, "unpaired surrogate") else if c.codes.first.or(0) < 32 then fail_at(s, "control character in a string") else s with out := s.out.add(c)
+
+fn unesc_step(s: Unesc, c: Str) -> Unesc
+= if s.bad != "" then s else match s.mode
+  | Unicode => unicode_step(s, s.hex + c)
+  | Escape => escape_step(s with mode := Plain, c)
+  | Plain => plain_step(s, c)
+
+fn unescape(t: Str) -> Res[Str, Str]
+= do
+  s = t.drop(1).take(t.len - 2).chars.fold(Unesc{out: str_buf(), mode: Plain, hex: "", high: 0, bad: ""}, unesc_step)
+  if s.bad != "" then err(s.bad) else if s.high != 0 or s.mode != Plain then err("unpaired surrogate") else ok(s.out.str)
+
+type Frame = FArr{items: List[JsonValue]} | FObj{fields: List[(Str, JsonValue)], key: Str}
+
+type Want = WValue | WValueOrEnd | WKeyOrEnd | WKey | WColon | WCommaOrEnd | WDone
+
+fn no_frames() -> List[Frame]
+= []
+
+fn max_depth() -> Int
+= 32
+
+fn scalar(t: Str) -> Res[JsonValue, Str]
+= if t == "true" then ok(JBool{value: true}) else if t == "false" then ok(JBool{value: false}) else if t == "null" then ok(JNull) else if t.starts_with("\"") then unescape(t).map(s => JStr{value: s}) else ok(JNum{text: t})
+
+fn closes(t: Str) -> Bool
+= t == "]" or t == "}"
+
+fn close(stack: List[Frame], t: Str) -> Opt[JsonValue]
+= match stack.last
+  | some(FArr{items}) if t == "]" => some(JArr{items})
+  | some(FObj{fields}) if t == "}" => some(JObj{fields})
+  | _ => none
+
+type PState = {stack: List[Frame], want: Want, result: JsonValue, bad: Str}
+
+type Step = (PState, Opt[JsonValue])
+
+fn fail_p(p: PState, why: Str) -> Step
+= (p with bad := why, none)
+
+fn replace_top(st: List[Frame], f: Frame) -> List[Frame]
+= st.take(st.len - 1).push(f)
+
+fn closed(p: PState, t: Str) -> Step
+= match close(p.stack, t)
+  | some(v) => (p, some(v))
+  | none => fail_p(p, "mismatched {t}")
+
+fn member_name(p: PState, k: Res[Str, Str]) -> Step
+= match (k, p.stack.last)
+  | (err(e), _) => fail_p(p, e)
+  | (ok(name), some(FObj{fields})) => if fields.any(f => f.0 == name) then fail_p(p, "duplicate member {name}") else (p with stack := replace_top(p.stack, FObj{fields, key: name}), want := WColon, none)
+  | _ => fail_p(p, "expected a member name")
+
+fn key_step(p: PState, t: Str, may_end: Bool) -> Step
+= if t.starts_with("\"") then member_name(p, unescape(t)) else if t == "}" and may_end then closed(p, t) else fail_p(p, "expected a member name")
+
+fn after_comma(stack: List[Frame]) -> Want
+= match stack.last
+  | some(FArr{}) => WValue
+  | _ => WKey
+
+fn comma_step(p: PState, t: Str) -> Step
+= if t == "," then (p with want := after_comma(p.stack), none) else if closes(t) then closed(p, t) else fail_p(p, "expected , or a closing bracket")
+
+fn open_frame(p: PState, f: Frame, w: Want) -> Step
+= if p.stack.len >= max_depth() then fail_p(p, "nested too deep") else (p with stack := p.stack.push(f), want := w, none)
+
+fn value_step(p: PState, t: Str, may_end: Bool) -> Step
+= if t == "[" then open_frame(p, FArr{items: []}, WValueOrEnd) else if t == "\{" then open_frame(p, FObj{fields: [], key: ""}, WKeyOrEnd) else if t == "]" and may_end then closed(p, t) else if t == "," or t == ":" or closes(t) then fail_p(p, "unexpected {t}") else match scalar(t)
+  | ok(v) => (p, some(v))
+  | err(e) => fail_p(p, e)
+
+fn advance(p: PState, t: Str) -> Step
+= match p.want
+  | WDone => fail_p(p, "data after the JSON value")
+  | WColon => if t == ":" then (p with want := WValue, none) else fail_p(p, "expected :")
+  | WKey => key_step(p, t, false)
+  | WKeyOrEnd => key_step(p, t, true)
+  | WCommaOrEnd => comma_step(p, t)
+  | WValue => value_step(p, t, false)
+  | WValueOrEnd => value_step(p, t, true)
+
+fn place(p: PState, v: JsonValue) -> PState
+= match p.stack.last
+  | none => p with result := v, want := WDone
+  | some(FArr{items}) => p with stack := replace_top(p.stack, FArr{items: items.push(v)}), want := WCommaOrEnd
+  | some(FObj{fields, key}) => p with stack := replace_top(p.stack, FObj{fields: fields.push((key, v)), key: ""}), want := WCommaOrEnd
+
+fn attach(r: Step, t: Str) -> PState
+= match r
+  | (p, none) => p
+  | (p, some(v)) => if p.bad != "" then p else place(p with stack := if closes(t) then p.stack.take(p.stack.len - 1) else p.stack, v)
+
+fn parse_step(p: PState, t: Str) -> PState
+= if p.bad != "" then p else attach(advance(p, t), t)
+
+fn finish_parse(p: PState) -> Res[JsonValue, Str]
+= if p.bad != "" then err(p.bad) else if p.want != WDone then err("the JSON text ends early") else ok(p.result)
+
+// Parses JSON text (RFC 8259) strictly: one value, nested at most 32 deep, no duplicate member
+// names in an object, no lone surrogates, nothing after the value. `err` says what is wrong.
+pub fn parse_json(s: Str) -> Res[JsonValue, Str]
+  ex parse_json("\{\"a\": [1, true, null]}") == ok(JObj{fields: [("a", JArr{items: [JNum{text: "1"}, JBool{value: true}, JNull]})]})
+  ex parse_json("\{\"a\": 1, \"a\": 2}") == err("duplicate member a")
+= match lex(s)
+  | err(e) => err(e)
+  | ok(ts) => finish_parse(ts.fold(PState{stack: no_frames(), want: WValue, result: JNull, bad: ""}, parse_step))
+
+fn esc_char(c: Str) -> Str
+= do
+  n = c.codes.first.or(0)
+  if c == "\"" then "\\\"" else if c == "\\" then "\\\\" else if c == "\n" then "\\n" else if c == "\r" then "\\r" else if c == "\t" then "\\t" else if n < 32 then "\\u00" + n.format("02x") else c
+
+fn quote(s: Str) -> Str
+= "\"" + s.chars.map(esc_char).join("") + "\""
+
+// The compact JSON text of `v`: no spaces, members in order, strings escaped as RFC 8259
+// requires (quote, backslash and control characters), other characters as they are.
+pub fn json_text(v: JsonValue) -> Str
+  ex json_text(JObj{fields: [("a", JStr{value: "x\"y"}), ("b", JArr{items: [JNum{text: "1"}, JNull]})]}) == "\{\"a\":\"x\\\"y\",\"b\":[1,null]}"
+= match v
+  | JNull => "null"
+  | JBool{value} => if value then "true" else "false"
+  | JNum{text} => text
+  | JStr{value} => quote(value)
+  | JArr{items} => "[" + items.map(json_text).join(",") + "]"
+  | JObj{fields} => "\{" + fields.map(f => quote(f.0) + ":" + json_text(f.1)).join(",") + "}"
+
+// A JSON number for an integer.
+pub fn jint(n: Int) -> JsonValue
+  ex jint(-5) == JNum{text: "-5"}
+= JNum{text: n.str}
+
+// A JSON string.
+pub fn jstr(s: Str) -> JsonValue
+  ex jstr("a") == JStr{value: "a"}
+= JStr{value: s}
+
+// The member `name` of an object, or none (also for values that are not objects).
+pub fn member(v: JsonValue, name: Str) -> Opt[JsonValue]
+= match v
+  | JObj{fields} => fields.find(f => f.0 == name).map(f => f.1)
+  | _ => none
+
+// The integer a JSON number denotes, rounded down when it has a fraction or an exponent
+// (NumericDate values may be fractional), or none when it doesn't fit in an Int.
+pub fn json_int(v: JsonValue) -> Opt[Int]
+= match v
+  | JNum{text} => if text.chars.all(c => "-0123456789".contains(c)) then text.to_int else float_int(text)
+  | _ => none
+
+fn float_int(text: Str) -> Opt[Int]
+= match text.to_f64
+  | some(x) => if x.is_finite and x.abs < 9000000000000000.0 then some(x.floor) else none
+  | none => none
+
+// ---------- base64url ----------
+
+// `b` as unpadded base64url, the encoding of every JWS segment.
+pub fn b64url(b: Bytes) -> Str
+= b.base64url
+
+// The bytes of a canonical unpadded base64url segment: only `A-Z a-z 0-9 - _`, no padding, no
+// whitespace, and unused trailing bits zero. Anything else is none.
+pub fn from_b64url(s: Str) -> Opt[Bytes]
+  ex from_b64url("YQ") == some("a".to_bytes)
+  ex from_b64url("YQ==") == none
+  ex from_b64url("YR") == none
+= if s.chars.all(c => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".contains(c)) then from_base64url(s) else none
+
+// ---------- algorithms and keys ----------
+
+// A JWS algorithm this package implements: HMAC with SHA-256, SHA-384 or SHA-512, and EdDSA
+// with Ed25519.
+pub type Alg = HS256 | HS384 | HS512 | EdDSA derive Eq, Show
+
+// The `alg` header value of `a`.
+pub fn alg_name(a: Alg) -> Str
+  ex alg_name(EdDSA) == "EdDSA"
+= match a
+  | HS256 => "HS256"
+  | HS384 => "HS384"
+  | HS512 => "HS512"
+  | EdDSA => "EdDSA"
+
+// The algorithm an `alg` header value names, matched exactly (names are case-sensitive), or none.
+// `none` and every algorithm this package doesn't implement are none.
+pub fn alg_of(name: Str) -> Opt[Alg]
+  ex alg_of("HS256") == some(HS256)
+  ex alg_of("hs256") == none
+= [HS256, HS384, HS512, EdDSA].find(a => alg_name(a) == name)
+
+// Every algorithm, for a policy that accepts whatever the keys allow.
+pub fn all_algs() -> List[Alg]
+  post r.len == 4
+= [HS256, HS384, HS512, EdDSA]
+
+fn hmac_size(a: Alg) -> Int
+= match a
+  | HS256 => 32
+  | HS384 => 48
+  | HS512 => 64
+  | EdDSA => 0
+
+// A key, bound to exactly one algorithm: an HMAC secret for `alg`, an Ed25519 signing key (its
+// 32-byte secret seed and public key `x`), or an Ed25519 verifying key. `kid` is the key id that
+// tokens name in their header. Keys hold secrets, which can't be compared or printed, so `Key`
+// derives neither `Eq` nor `Show`; build keys with `hmac_key`, `ed25519_signing_key` and
+// `ed25519_verifying_key`, which check them.
+pub type Key = HmacKey{alg: Alg, kid: Opt[Str], mac_key: Secret[Bytes]} | EdSigningKey{kid: Opt[Str], seed: Secret[Bytes], x: Bytes} | EdVerifyingKey{kid: Opt[Str], x: Bytes}
+
+fn hmac_ok(alg: Alg, k: Secret[Bytes]) -> Bool
+= hmac_size(alg) > 0 and k.check(b => b.len >= hmac_size(alg))
+
+// An HMAC key for `alg` (HS256, HS384 or HS512). RFC 7518 section 3.2 requires a key at least as
+// long as the hash: 32, 48 or 64 bytes.
+pub fn hmac_key(alg: Alg, k: Secret[Bytes]) -> Res[Key, JwtErr]
+= if hmac_size(alg) == 0 then err(InvalidKey{why: "{alg_name(alg)} is not an HMAC algorithm"}) else if hmac_ok(alg, k) then ok(HmacKey{alg, kid: none, mac_key: k}) else err(InvalidKey{why: "an {alg_name(alg)} key must be at least {hmac_size(alg)} bytes"})
+
+// An Ed25519 signing key from its 32-byte secret seed (the JWK `d`).
+pub fn ed25519_signing_key(seed: Secret[Bytes]) -> Res[Key, JwtErr]
+= if seed.check(b => b.len == 32) then ok(EdSigningKey{kid: none, seed, x: crypto.public_key(seed)}) else err(InvalidKey{why: "an Ed25519 seed must be 32 bytes"})
+
+// An Ed25519 verifying key from its 32-byte public key (the JWK `x`).
+pub fn ed25519_verifying_key(x: Bytes) -> Res[Key, JwtErr]
+= if x.len == 32 then ok(EdVerifyingKey{kid: none, x}) else err(InvalidKey{why: "an Ed25519 public key must be 32 bytes"})
+
+// A new random HMAC key of the minimum size for `alg`.
+pub fn generate_hmac_key(alg: Alg) -> Res[Key, JwtErr] ! rand
+= if hmac_size(alg) == 0 then err(InvalidKey{why: "{alg_name(alg)} is not an HMAC algorithm"}) else hmac_key(alg, secret(crypto.random(hmac_size(alg))))
+
+// A new random Ed25519 signing key.
+pub fn generate_ed25519_key() -> Key ! rand
+= do
+  (sk, pk) = crypto.keypair()
+  EdSigningKey{kid: none, seed: sk, x: pk}
+
+// `k` with the key id `kid`.
+pub fn with_kid(k: Key, kid: Str where _.len > 0) -> Key
+= match k
+  | HmacKey{alg, mac_key} => HmacKey{alg, kid: some(kid), mac_key}
+  | EdSigningKey{seed, x} => EdSigningKey{kid: some(kid), seed, x}
+  | EdVerifyingKey{x} => EdVerifyingKey{kid: some(kid), x}
+
+// The algorithm `k` is bound to.
+pub fn key_alg(k: Key) -> Alg
+= match k
+  | HmacKey{alg} => alg
+  | EdSigningKey => EdDSA
+  | EdVerifyingKey => EdDSA
+
+// The key id of `k`, if it has one.
+pub fn key_id(k: Key) -> Opt[Str]
+= match k
+  | HmacKey{kid} => kid
+  | EdSigningKey{kid} => kid
+  | EdVerifyingKey{kid} => kid
+
+// Whether `k` can sign: HMAC keys and Ed25519 signing keys can, verifying keys can't.
+pub fn can_sign(k: Key) -> Bool
+= not (k is EdVerifyingKey{})
+
+// The key that verifies what `k` signs and may be given to others: the verifying key of an
+// Ed25519 signing key, `k` itself for a verifying key, and none for an HMAC key, whose verifier
+// is the secret itself.
+pub fn verifying_key(k: Key) -> Opt[Key]
+= match k
+  | HmacKey => none
+  | EdSigningKey{kid, x} => some(EdVerifyingKey{kid, x})
+  | EdVerifyingKey => some(k)
+
+// The public key bytes of an Ed25519 key, none for an HMAC key.
+pub fn public_bytes(k: Key) -> Opt[Bytes]
+= match k
+  | HmacKey => none
+  | EdSigningKey{x} => some(x)
+  | EdVerifyingKey{x} => some(x)
+
+fn mac(alg: Alg, k: Secret[Bytes], data: Str) -> Bytes
+= match alg
+  | HS256 => crypto.hmac256(k, data)
+  | HS384 => hmac_sha384(k, data.to_bytes)
+  | HS512 => crypto.hmac512(k, data)
+  | EdDSA => bytes([])
+
+fn signature(k: Key, input: Str) -> Res[Bytes, JwtErr]
+= match k
+  | HmacKey{alg, mac_key} => if hmac_ok(alg, mac_key) then ok(mac(alg, mac_key, input)) else err(InvalidKey{why: "an {alg_name(alg)} key must be at least {hmac_size(alg)} bytes"})
+  | EdSigningKey{seed} => if seed.check(b => b.len == 32) then ok(crypto.sign(seed, input)) else err(InvalidKey{why: "an Ed25519 seed must be 32 bytes"})
+  | EdVerifyingKey => err(InvalidKey{why: "a verifying key cannot sign"})
+
+fn signature_ok(k: Key, input: Str, sig: Bytes) -> Bool
+= match k
+  | HmacKey{alg, mac_key} => hmac_ok(alg, mac_key) and crypto.equal(mac(alg, mac_key, input), sig)
+  | EdSigningKey{x} => x.len == 32 and sig.len == 64 and crypto.verify(x, input, sig)
+  | EdVerifyingKey{x} => x.len == 32 and sig.len == 64 and crypto.verify(x, input, sig)
+
+// The keys of `keys` that may verify a token with algorithm `alg` and key id `kid`: bound to
+// `alg`, and when `kid` is given, carrying that id.
+pub fn select_keys(keys: List[Key], kid: Opt[Str], alg: Alg) -> List[Key]
+= keys.filter(k => key_alg(k) == alg and (kid.is_none() or key_id(k) == kid))
+
+// ---------- JWS ----------
+
+// What verification accepts. `algs` is the allowlist (the header's `alg` must be in it and match
+// the key's); `leeway` is the clock skew allowed, in seconds, for `exp`, `nbf` and `iat`;
+// `max_age` limits how old `iat` may be; `issuers` and `audiences`, when not empty, are the
+// accepted `iss` values and the audiences of which `aud` must contain one; `subject` and `typ`
+// pin `sub` and the header's `typ`; `required` lists claims that must be present; `critical`
+// lists the `crit` header extensions the caller understands; `max_len` bounds the token length.
+pub type Policy = {algs: List[Alg], leeway: Int where _ >= 0, max_age: Opt[Int], issuers: List[Str], audiences: List[Str], subject: Opt[Str], typ: Opt[Str], required: List[Str], critical: List[Str], max_len: Int where _ > 0} derive Eq, Show
+
+// A policy that accepts `algs` and checks only the time claims that are present, with no leeway
+// and tokens of at most 8192 characters. Add requirements with `with`.
+pub fn policy(algs: List[Alg] where _.len > 0) -> Policy
+  ex policy([HS256]).max_len == 8192
+= Policy{algs, leeway: 0, max_age: none, issuers: [], audiences: [], subject: none, typ: none, required: [], critical: [], max_len: 8192}
+
+// A verified (or, from `decode_unverified`, merely decoded) JWS: its protected header, its
+// payload as text, and the algorithm and key id it named.
+pub type Jws = {header: JsonValue, payload: Str, alg: Alg, kid: Opt[Str]} derive Eq, Show
+
+fn registered_headers() -> List[Str]
+= ["alg", "jku", "jwk", "kid", "x5u", "x5c", "x5t", "x5t#S256", "typ", "cty", "crit", "enc", "zip"]
+
+fn text_of(s: Str, what: Str) -> Res[Str, JwtErr]
+= match from_b64url(s)
+  | none => err(Malformed{why: "the {what} is not canonical base64url"})
+  | some(b) => match b.to_str
+    | some(t) => ok(t)
+    | none => err(Malformed{why: "the {what} is not UTF-8"})
+
+fn crit_check(h: JsonValue, understood: List[Str]) -> Res[Unit, JwtErr]
+= match member(h, "crit")
+  | none => ok(())
+  | some(JArr{items}) => do
+    names = items.map(i => if i is JStr{value} then value else "")
+    if items.is_empty or names.any(n => n == "") then err(Malformed{why: "crit must be a non-empty array of names"})
+    else if names.any(n => registered_headers().contains(n)) then err(Malformed{why: "crit must not name a registered header"})
+    else crit_names(h, names, understood)
+  | some(_) => err(Malformed{why: "crit must be a non-empty array of names"})
+
+fn crit_names(h: JsonValue, names: List[Str], understood: List[Str]) -> Res[Unit, JwtErr]
+= match names.find(n => not understood.contains(n) or member(h, n).is_none())
+  | some(n) => err(UnknownCritical{name: n})
+  | none => ok(())
+
+fn header_alg(h: JsonValue) -> Res[Alg, JwtErr]
+= match member(h, "alg")
+  | some(JStr{value}) => alg_named(value)
+  | some(_) => err(Malformed{why: "alg must be a string"})
+  | none => err(Malformed{why: "the header has no alg"})
+
+fn alg_named(value: Str) -> Res[Alg, JwtErr]
+= match alg_of(value)
+  | some(a) => ok(a)
+  | none => err(UnsupportedAlg{alg: value})
+
+fn header_kid(h: JsonValue) -> Res[Opt[Str], JwtErr]
+= match member(h, "kid")
+  | none => ok(none)
+  | some(JStr{value}) => ok(some(value))
+  | some(_) => err(Malformed{why: "kid must be a string"})
+
+fn split3(token: Str, max_len: Int) -> Res[(Str, Str, Str), JwtErr]
+= if token.len > max_len then err(TooLarge{len: token.len, max: max_len}) else match token.split(".")
+  | [h, p, s] => if h == "" then err(Malformed{why: "empty header"}) else ok((h, p, s))
+  | [_, _, _, _, _] => err(Malformed{why: "encrypted tokens (JWE) are not supported"})
+  | _ => err(Malformed{why: "a compact JWS has three parts separated by dots"})
+
+fn decode_jws(token: Str, understood: List[Str], max_len: Int) -> Res[(Jws, Str, Bytes), JwtErr]
+= match split3(token, max_len)
+  | err(e) => err(e)
+  | ok((h64, p64, s64)) => match (text_of(h64, "header"), text_of(p64, "payload"), from_b64url(s64))
+    | (err(e), _, _) => err(e)
+    | (_, err(e), _) => err(e)
+    | (_, _, none) => err(Malformed{why: "the signature is not canonical base64url"})
+    | (ok(ht), ok(payload), some(sig)) => match parse_json(ht)
+      | err(e) => err(Malformed{why: "the header is not JSON: {e}"})
+      | ok(h) => if not (h is JObj{}) then err(Malformed{why: "the header is not a JSON object"}) else match (header_alg(h), header_kid(h), crit_check(h, understood))
+        | (err(e), _, _) => err(e)
+        | (_, err(e), _) => err(e)
+        | (_, _, err(e)) => err(e)
+        | (ok(alg), ok(kid), ok(_)) => if member(h, "b64") == some(JBool{value: false}) then err(Malformed{why: "unencoded payloads (b64: false) are not supported"}) else if sig.is_empty then err(Malformed{why: "empty signature"}) else ok((Jws{header: h, payload, alg, kid}, h64 + "." + p64, sig))
+
+// Verifies a compact JWS with `keys` under policy `p`'s `algs`, `critical` and `max_len`. The
+// header's `alg` must be in `p.algs`; then only keys bound to that algorithm, with the header's
+// `kid` when it has one, are tried. The payload can be any text; `verify` adds the JWT rules.
+pub fn jws_verify(token: Str, keys: List[Key], p: Policy) -> Res[Jws, JwtErr]
+  post r.is_ok or r.is_err
+= match decode_jws(token, p.critical, p.max_len)
+  | err(e) => err(e)
+  | ok((j, input, sig)) => if not p.algs.contains(j.alg) then err(AlgNotAllowed{alg: alg_name(j.alg)}) else do
+    candidates = select_keys(keys, j.kid, j.alg)
+    if candidates.is_empty then err(NoKey{kid: j.kid}) else if candidates.any(k => signature_ok(k, input, sig)) then ok(j) else err(BadSignature)
+
+fn compact(k: Key, header: Str, payload: Str) -> Res[Str, JwtErr]
+= do
+  input = b64url(header.to_bytes) + "." + b64url(payload.to_bytes)
+  signature(k, input).map(s => input + "." + b64url(s))
+
+// Signs `payload` with the exact header text `header`, which must be a JSON object whose `alg`
+// is `k`'s algorithm. For reproducing tokens byte for byte; `jws_sign` and `sign` build the
+// header themselves.
+pub fn sign_compact(k: Key, header: Str, payload: Str) -> Res[Str, JwtErr]
+= match parse_json(header)
+  | err(e) => err(Malformed{why: "the header is not JSON: {e}"})
+  | ok(h) => match header_alg(h)
+    | err(e) => err(e)
+    | ok(a) => if not (h is JObj{}) then err(Malformed{why: "the header is not a JSON object"}) else if a != key_alg(k) then err(InvalidKey{why: "the key is for {alg_name(key_alg(k))}, the header says {alg_name(a)}"}) else compact(k, header, payload)
+
+fn header_for(k: Key, extra: List[(Str, JsonValue)]) -> Res[Str, JwtErr]
+= do
+  base = [("alg", jstr(alg_name(key_alg(k))))] + (match key_id(k)
+    | some(id) => [("kid", jstr(id))]
+    | none => [])
+  if extra.any(e => e.0 == "alg" or e.0 == "kid" or e.0 == "crit" or e.0 == "b64") then err(Malformed{why: "alg, kid, crit and b64 are set by the key, not by extra headers"})
+  else if extra.map(e => e.0).unique.len != extra.len then err(Malformed{why: "duplicate header"})
+  else ok(json_text(JObj{fields: base + extra}))
+
+// Signs `payload` (any text) as a compact JWS: the header is `alg` from the key, `kid` when the
+// key has one, then `extra` (which may not set `alg`, `kid`, `crit` or `b64`).
+pub fn jws_sign(k: Key, extra: List[(Str, JsonValue)], payload: Str) -> Res[Str, JwtErr]
+  post r.is_ok or r.is_err
+= match header_for(k, extra)
+  | err(e) => err(e)
+  | ok(h) => compact(k, h, payload)
+
+// Decodes a token without checking its signature, for reading its header (`kid`, `alg`) before
+// choosing keys, or for debugging. Never trust what it returns. Parsing is as strict as
+// `jws_verify`'s, with no `crit` extension understood.
+pub fn decode_unverified(token: Str, max_len: Int where _ > 0) -> Res[Jws, JwtErr]
+  post r.is_ok or r.is_err
+= decode_jws(token, [], max_len).map(t => t.0)
+
+// ---------- JWT claims ----------
+
+// The registered claims of RFC 7519 section 4.1. `aud` is a list whether the token carries one
+// string or an array; the times are NumericDates in Unix seconds.
+pub type Claims = {iss: Opt[Str], sub: Opt[Str], aud: List[Str], exp: Opt[Int], nbf: Opt[Int], iat: Opt[Int], jti: Opt[Str]} derive Eq, Show
+
+// No claims, to fill in with `with`.
+pub fn claims() -> Claims
+  post r.aud.is_empty
+= Claims{iss: none, sub: none, aud: [], exp: none, nbf: none, iat: none, jti: none}
+
+// A verified JWT: its JWS header, the registered claims, the whole payload as parsed JSON and
+// as text (decode it into your own type with `json.decode[T](t.payload)`), and the header's
+// `alg`, `kid` and `typ`.
+pub type Token = {header: JsonValue, claims: Claims, payload: JsonValue, text: Str, alg: Alg, kid: Opt[Str], typ: Opt[Str]} derive Eq, Show
+
+fn str_claim(o: JsonValue, name: Str) -> Res[Opt[Str], JwtErr]
+= match member(o, name)
+  | none => ok(none)
+  | some(JStr{value}) => ok(some(value))
+  | some(_) => err(BadClaim{name, why: "must be a string"})
+
+fn time_claim(o: JsonValue, name: Str) -> Res[Opt[Int], JwtErr]
+= match member(o, name)
+  | none => ok(none)
+  | some(v) => match json_int(v)
+    | some(n) => ok(some(n))
+    | none => err(BadClaim{name, why: "must be a NumericDate (seconds since the epoch)"})
+
+fn aud_claim(o: JsonValue) -> Res[List[Str], JwtErr]
+= match member(o, "aud")
+  | none => ok([])
+  | some(JStr{value}) => ok([value])
+  | some(JArr{items}) => if items.all(i => i is JStr{}) then ok(items.map(i => if i is JStr{value} then value else "")) else err(BadClaim{name: "aud", why: "must be a string or an array of strings"})
+  | some(_) => err(BadClaim{name: "aud", why: "must be a string or an array of strings"})
+
+// The registered claims of a JWT payload, which must be a JSON object, with each registered claim
+// of the right type.
+pub fn claims_of(payload: JsonValue) -> Res[Claims, JwtErr]
+  ex claims_of(JObj{fields: [("sub", jstr("u1")), ("aud", jstr("api"))]}) == ok(claims() with sub := some("u1"), aud := ["api"])
+= if not (payload is JObj{}) then err(Malformed{why: "the JWT payload is not a JSON object"}) else match (str_claim(payload, "iss"), str_claim(payload, "sub"), str_claim(payload, "jti"), aud_claim(payload), time_claim(payload, "exp"), time_claim(payload, "nbf"), time_claim(payload, "iat"))
+  | (ok(iss), ok(sub), ok(jti), ok(aud), ok(exp), ok(nbf), ok(iat)) => ok(Claims{iss, sub, aud, exp, nbf, iat, jti})
+  | (err(e), _, _, _, _, _, _) => err(e)
+  | (_, err(e), _, _, _, _, _) => err(e)
+  | (_, _, err(e), _, _, _, _) => err(e)
+  | (_, _, _, err(e), _, _, _) => err(e)
+  | (_, _, _, _, err(e), _, _) => err(e)
+  | (_, _, _, _, _, err(e), _) => err(e)
+  | (_, _, _, _, _, _, err(e)) => err(e)
+
+// The JSON object of `c`'s claims that are set, then `extra` (your own claims). A name in
+// `extra` that is also a registered claim set in `c`, or that appears twice, is an error.
+pub fn claims_json(c: Claims, extra: List[(Str, JsonValue)]) -> Res[JsonValue, JwtErr]
+  ex claims_json(claims() with sub := some("u"), [("admin", JBool{value: true})]).map(json_text) == ok("\{\"sub\":\"u\",\"admin\":true}")
+= do
+  fn s(n: Str, v: Opt[Str]) -> List[(Str, JsonValue)]
+  = v.map(x => [(n, jstr(x))]).or([])
+  fn t(n: Str, v: Opt[Int]) -> List[(Str, JsonValue)]
+  = v.map(x => [(n, jint(x))]).or([])
+  aud = match c.aud
+    | [] => []
+    | [one] => [("aud", jstr(one))]
+    | many => [("aud", JArr{items: many.map(jstr)})]
+  fields = s("iss", c.iss) + s("sub", c.sub) + aud + t("exp", c.exp) + t("nbf", c.nbf) + t("iat", c.iat) + s("jti", c.jti) + extra
+  if fields.map(f => f.0).unique.len != fields.len then err(Malformed{why: "a claim is set twice"}) else ok(JObj{fields})
+
+fn norm_typ(t: Str) -> Str
+= if t.lower.starts_with("application/") then t.lower.drop(12) else t.lower
+
+// Checks the claims and the `typ` of a decoded token against `p` at `now` (Unix seconds):
+// `exp` must be after `now - leeway`, `nbf` at most `now + leeway`, `iat` not after
+// `now + leeway` (and within `max_age` when set), `iss`, `aud`, `sub` and `typ` as `p` requires,
+// and every claim in `p.required` present. `typ` compares without case and without an
+// `application/` prefix (RFC 7515 section 4.1.9).
+pub fn check_claims(t: Token, p: Policy, now: Int) -> Res[Unit, JwtErr]
+  post r.is_ok or r.is_err
+= match [required_error(t, p), time_error(t.claims, p.leeway, now), age_error(t.claims, p, now), identity_error(t, p)].find(_.is_some).or(none)
+  | some(e) => err(e)
+  | none => ok(())
+
+fn required_error(t: Token, p: Policy) -> Opt[JwtErr]
+= p.required.find(n => member(t.payload, n).is_none()).map(n => MissingClaim{name: n})
+
+fn time_error(c: Claims, l: Int, now: Int) -> Opt[JwtErr]
+= match (c.exp, c.nbf, c.iat)
+  | (some(e), _, _) if now - l >= e => some(Expired{exp: e, now})
+  | (_, some(n), _) if now + l < n => some(NotYetValid{nbf: n, now})
+  | (_, _, some(i)) if i > now + l => some(IssuedInFuture{iat: i, now})
+  | _ => none
+
+fn age_error(c: Claims, p: Policy, now: Int) -> Opt[JwtErr]
+= match (p.max_age, c.iat)
+  | (none, _) => none
+  | (some(_), none) => some(MissingClaim{name: "iat"})
+  | (some(m), some(i)) => if now - i > m + p.leeway then some(IssuedTooLongAgo{iat: i, max_age: m}) else none
+
+fn typ_ok(have: Opt[Str], want: Opt[Str]) -> Bool
+= match (have, want)
+  | (_, none) => true
+  | (some(h), some(w)) => norm_typ(h) == norm_typ(w)
+  | (none, some(_)) => false
+
+fn identity_error(t: Token, p: Policy) -> Opt[JwtErr]
+= do
+  c = t.claims
+  bad_iss = not p.issuers.is_empty() and not c.iss.map(i => p.issuers.contains(i)).or(false)
+  bad_aud = not p.audiences.is_empty() and not c.aud.any(a => p.audiences.contains(a))
+  bad_sub = p.subject.is_some() and c.sub != p.subject
+  if bad_iss then some(WrongIssuer{iss: c.iss}) else if bad_aud then some(WrongAudience{aud: c.aud}) else if bad_sub then some(WrongSubject{sub: c.sub}) else if not typ_ok(t.typ, p.typ) then some(WrongType{typ: t.typ}) else none
+
+fn token_of(j: Jws) -> Res[Token, JwtErr]
+= match parse_json(j.payload)
+  | err(e) => err(Malformed{why: "the JWT payload is not JSON: {e}"})
+  | ok(o) => match (claims_of(o), member(j.header, "typ"))
+    | (err(e), _) => err(e)
+    | (ok(c), none) => ok(Token{header: j.header, claims: c, payload: o, text: j.payload, alg: j.alg, kid: j.kid, typ: none})
+    | (ok(c), some(JStr{value})) => ok(Token{header: j.header, claims: c, payload: o, text: j.payload, alg: j.alg, kid: j.kid, typ: some(value)})
+    | (ok(_), some(_)) => err(Malformed{why: "typ must be a string"})
+
+// Verifies a JWT: the signature as `jws_verify` does, then the payload as a JSON object with
+// well-typed registered claims, then `check_claims` at `now` (Unix seconds).
+pub fn verify(token: Str, keys: List[Key], p: Policy, now: Int) -> Res[Token, JwtErr]
+  post r.is_ok or r.is_err
+= match jws_verify(token, keys, p)
+  | err(e) => err(e)
+  | ok(j) => match token_of(j)
+    | err(e) => err(e)
+    | ok(t) => check_claims(t, p, now).map(u => t)
+
+// `verify` at the current time.
+pub fn verify_now(token: Str, keys: List[Key], p: Policy) -> Res[Token, JwtErr] ! time
+= verify(token, keys, p, now_ms() / 1000)
+
+// Decodes a JWT without checking its signature or its claims. Never trust what it returns.
+pub fn decode_jwt_unverified(token: Str, max_len: Int where _ > 0) -> Res[Token, JwtErr]
+  post r.is_ok or r.is_err
+= match decode_unverified(token, max_len)
+  | err(e) => err(e)
+  | ok(j) => token_of(j)
+
+// Signs a JWT with `k`: header `alg`, `typ: JWT` and `kid` when the key has one; payload the
+// claims of `c` that are set, then `extra`.
+pub fn sign(k: Key, c: Claims, extra: List[(Str, JsonValue)]) -> Res[Str, JwtErr]
+  post r.is_ok or r.is_err
+= match claims_json(c, extra)
+  | err(e) => err(e)
+  | ok(o) => jws_sign(k, [("typ", jstr("JWT"))], json_text(o))
+
+// Signs the JSON object text `payload` as a JWT, for claims written with `json.encode` of your
+// own record type. The text is signed exactly as given.
+pub fn sign_payload(k: Key, payload: Str) -> Res[Str, JwtErr]
+  post r.is_ok or r.is_err
+= match parse_json(payload)
+  | err(e) => err(Malformed{why: "the payload is not JSON: {e}"})
+  | ok(o) => match claims_of(o)
+    | err(e) => err(e)
+    | ok(_) => jws_sign(k, [("typ", jstr("JWT"))], payload)
+
+// The claim `name` of a token's payload, if present.
+pub fn claim(t: Token, name: Str) -> Opt[JsonValue]
+= member(t.payload, name)
+
+// The claim `name` if it is a string.
+pub fn claim_str(t: Token, name: Str) -> Opt[Str]
+= match claim(t, name)
+  | some(JStr{value}) => some(value)
+  | _ => none
+
+// The claim `name` if it is a number that fits an Int (rounded down).
+pub fn claim_int(t: Token, name: Str) -> Opt[Int]
+= claim(t, name).map(json_int).or(none)
+
+// The claim `name` if it is a boolean.
+pub fn claim_bool(t: Token, name: Str) -> Opt[Bool]
+= match claim(t, name)
+  | some(JBool{value}) => some(value)
+  | _ => none
+
+// The claim `name` as a list of strings: a string is a list of one, an array must hold only
+// strings. Scopes and roles are often one of these.
+pub fn claim_strs(t: Token, name: Str) -> Opt[List[Str]]
+= match claim(t, name)
+  | some(JStr{value}) => some(if name == "scope" then value.split(" ").filter(s => s != "") else [value])
+  | some(JArr{items}) => if items.all(i => i is JStr{}) then some(items.map(i => if i is JStr{value} then value else "")) else none
+  | _ => none
+
+// The token of an `Authorization: Bearer <token>` header (RFC 6750), if the request has one.
+pub fn bearer_token(req: Request) -> Opt[Str]
+= match req.header("authorization").or("").trim.split_once(" ")
+  | some((scheme, t)) => if scheme.lower == "bearer" and t.trim != "" then some(t.trim) else none
+  | none => none
+
+// ---------- JWK and JWK sets ----------
+
+fn jwk_str(j: JsonValue, name: Str) -> Res[Opt[Str], JwtErr]
+= match member(j, name)
+  | none => ok(none)
+  | some(JStr{value}) => ok(some(value))
+  | some(_) => err(BadJwks{why: "{name} must be a string"})
+
+fn jwk_bytes(v: Opt[Str], name: Str) -> Res[Opt[Bytes], JwtErr]
+= match v
+  | none => ok(none)
+  | some(s) => match from_b64url(s)
+    | some(b) => ok(some(b))
+    | none => err(BadJwks{why: "{name} is not canonical base64url"})
+
+fn ops_ok(j: JsonValue, private: Bool) -> Bool
+= match member(j, "key_ops")
+  | none => true
+  | some(JArr{items}) => items.contains(jstr("verify")) or private and items.contains(jstr("sign"))
+  | some(_) => false
+
+fn okp_key(j: JsonValue, kid: Opt[Str], alg: Opt[Str], private: Bool) -> Res[Opt[Key], JwtErr]
+= match (jwk_str(j, "crv"), jwk_str(j, "x").map(x => jwk_bytes(x, "x")).or(err(BadJwks{why: "x must be a string"})), jwk_str(j, "d").map(d => jwk_bytes(d, "d")).or(err(BadJwks{why: "d must be a string"})))
+  | (err(e), _, _) => err(e)
+  | (_, err(e), _) => err(e)
+  | (_, _, err(e)) => err(e)
+  | (ok(crv), ok(x), ok(d)) => if crv != some("Ed25519") then ok(none) else if alg.is_some() and alg != some("EdDSA") then err(BadJwks{why: "an Ed25519 key must have alg EdDSA"}) else if d.is_some() and not private then err(BadJwks{why: "a public key set contains a private key (d)"}) else match (x, d)
+    | (none, _) => err(BadJwks{why: "an OKP key needs x"})
+    | (some(xb), none) => ed25519_verifying_key(xb).map(k => some(named(k, kid)))
+    | (some(xb), some(db)) => match ed25519_signing_key(secret(db))
+      | err(e) => err(e)
+      | ok(k) => if public_bytes(k) == some(xb) then ok(some(named(k, kid))) else err(BadJwks{why: "x is not the public key of d"})
+
+fn oct_key(j: JsonValue, kid: Opt[Str], alg: Opt[Str], private: Bool) -> Res[Opt[Key], JwtErr]
+= if not private then err(BadJwks{why: "a public key set contains a symmetric (oct) key"}) else match (jwk_str(j, "k"), alg.map(alg_of).or(none))
+  | (err(e), _) => err(e)
+  | (ok(none), _) => err(BadJwks{why: "an oct key needs k"})
+  | (_, none) => err(BadJwks{why: "an oct key needs alg HS256, HS384 or HS512"})
+  | (ok(some(k64)), some(a)) => match from_b64url(k64)
+    | none => err(BadJwks{why: "k is not canonical base64url"})
+    | some(kb) => hmac_key(a, secret(kb)).map(k => some(named(k, kid)))
+
+fn named(k: Key, kid: Opt[Str]) -> Key
+= match kid
+  | some(id) => if id == "" then k else with_kid(k, id)
+  | none => k
+
+fn jwk_key(j: JsonValue, private: Bool) -> Res[Opt[Key], JwtErr]
+= if not (j is JObj{}) then err(BadJwks{why: "a key is not a JSON object"}) else match (jwk_str(j, "kty"), jwk_str(j, "kid"), jwk_str(j, "alg"), jwk_str(j, "use"))
+  | (err(e), _, _, _) => err(e)
+  | (_, err(e), _, _) => err(e)
+  | (_, _, err(e), _) => err(e)
+  | (_, _, _, err(e)) => err(e)
+  | (ok(kty), ok(kid), ok(alg), ok(use_)) => if use_.is_some() and use_ != some("sig") then ok(none) else if not ops_ok(j, private) then ok(none) else if kty == some("OKP") then okp_key(j, kid, alg, private) else if kty == some("oct") then oct_key(j, kid, alg, private) else if kty.is_none() then err(BadJwks{why: "a key has no kty"}) else ok(none)
+
+fn jwks_keys(text: Str, private: Bool) -> Res[List[Key], JwtErr]
+= match parse_json(text)
+  | err(e) => err(BadJwks{why: "not JSON: {e}"})
+  | ok(o) => match member(o, "keys")
+    | some(JArr{items}) => items.fold(ok(no_keys()), (acc, j) => add_key(acc, j, private))
+    | _ => err(BadJwks{why: "a JWK set is an object with a keys array"})
+
+fn add_key(acc: Res[List[Key], JwtErr], j: JsonValue, private: Bool) -> Res[List[Key], JwtErr]
+= match acc
+  | err(e) => err(e)
+  | ok(ks) => jwk_key(j, private).map(k => ks + k.map(x => [x]).or([]))
+
+fn no_keys() -> List[Key]
+= []
+
+// The verifying keys of a public JWK set (RFC 7517 section 5), such as an issuer's
+// `jwks_uri` document. Ed25519 keys (`kty` OKP, `crv` Ed25519) are read; keys of other types and
+// curves (RSA, EC, X25519) and keys whose `use` or `key_ops` exclude verification are skipped.
+// A set that carries private material (`d`, or a symmetric `oct` key) is refused, since
+// publishing it would have leaked it.
+pub fn parse_jwks(text: Str) -> Res[List[Key], JwtErr]
+  post r.is_ok or r.is_err
+= jwks_keys(text, false)
+
+// The keys of a private JWK set: Ed25519 signing keys (with `d`, checked against `x`),
+// verifying keys, and symmetric `oct` keys, which must name their `alg` so they are bound to it.
+pub fn parse_private_jwks(text: Str) -> Res[List[Key], JwtErr]
+  post r.is_ok or r.is_err
+= jwks_keys(text, true)
+
+// One JWK, private parts allowed; none when it is of a type this package skips.
+pub fn parse_jwk(text: Str) -> Res[Opt[Key], JwtErr]
+  post r.is_ok or r.is_err
+= match parse_json(text)
+  | err(e) => err(BadJwks{why: "not JSON: {e}"})
+  | ok(j) => jwk_key(j, true)
+
+fn okp_fields(x: Bytes) -> List[(Str, JsonValue)]
+= [("crv", jstr("Ed25519")), ("kty", jstr("OKP")), ("x", jstr(b64url(x)))]
+
+// The public JWK of `k` (`kty` OKP, `crv` Ed25519, `x`, with `kid`, `alg` and `use` sig), or
+// none for an HMAC key, which has no public part.
+pub fn public_jwk(k: Key) -> Opt[JsonValue]
+= public_bytes(k).map(x => JObj{fields: [("kty", jstr("OKP")), ("crv", jstr("Ed25519")), ("x", jstr(b64url(x)))] + key_id(k).map(id => [("kid", jstr(id))]).or([]) + [("alg", jstr("EdDSA")), ("use", jstr("sig"))]})
+
+// The public JWK set of `keys`, as an issuer publishes it; HMAC keys are left out.
+pub fn public_jwks(keys: List[Key]) -> Str
+  post r.starts_with("\{\"keys\":[")
+= json_text(JObj{fields: [("keys", JArr{items: keys.map(public_jwk).filter(_.is_some).map(j => j.or(JNull))})]})
+
+// The RFC 7638 thumbprint of an Ed25519 key (base64url SHA-256 of its canonical JWK, as RFC
+// 8037 section A.3 shows), a common `kid`; none for an HMAC key.
+pub fn thumbprint(k: Key) -> Opt[Str]
+= public_bytes(k).map(x => b64url(crypto.sha256(json_text(JObj{fields: okp_fields(x)}))))
+
+// ---------- tests: SHA-384 ----------
+
+fn primes(n: Int) -> List[Int]
+= (2..600).filter(x => (2..x).all(d => d * d > x or x % d != 0)).take(n)
+
+fn iroot(n: BigInt, k: Int) -> BigInt
+= do
+  var lo = big(0)
+  var hi = big(2).pow(80)
+  for i in 0..82
+    mid = lo.add(hi).div(big(2))
+    if mid.pow(k) <= n then lo := mid else hi := mid
+  lo
+
+fn frac_bits(p: Int, k: Int) -> Int
+= do
+  two64 = big(2).pow(64)
+  r = iroot(big(p).mul(big(2).pow(64 * k)), k)
+  low = r.sub(r.div(two64).mul(two64))
+  (if low >= big(2).pow(63) then low.sub(two64) else low).to_int.or(0)
+
+test sha2_constants = do
+  ps = primes(80)
+  ps.map(p => frac_bits(p, 3)) == sha2_k() and ps.take(8).map(p => frac_bits(p, 2)) == sha512_iv() and ps.drop(8).take(8).map(p => frac_bits(p, 2)) == sha384_iv()
+
+test sha512_matches_stdlib = [0, 1, 3, 55, 56, 63, 64, 100, 111, 112, 113, 127, 128, 129, 200, 239, 240, 241, 255, 256, 257, 1000].all(n => do
+  m = bytes((0..n).map(i => (i * 131 + 7) % 256))
+  sha512_here(m) == crypto.sha512(m))
+
+test sha512_text_matches_stdlib = ["", "abc", "a".repeat(111), "a".repeat(112), "héllo wörld", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"].all(s => sha512_here(s.to_bytes) == crypto.sha512(s))
+
+test sha384_vectors = sha384("abc".to_bytes).hex == "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7" and sha384("".to_bytes).hex == "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b" and sha384("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu".to_bytes).hex == "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039"
+
+fn rfc4231_key6() -> Secret[Bytes]
+= secret(bytes((0..131).map(i => 170)))
+
+test hmac_sha384_rfc4231 = hmac_sha384(secret(bytes((0..20).map(i => 11))), "Hi There".to_bytes).hex == "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6" and hmac_sha384(secret("Jefe".to_bytes), "what do ya want for nothing?".to_bytes).hex == "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649" and hmac_sha384(rfc4231_key6(), "Test Using Larger Than Block-Size Key - Hash Key First".to_bytes).hex == "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952" and hmac_sha384(rfc4231_key6(), "This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.".to_bytes).hex == "6617178e941f020d351e2f254e8fd32c602420feb0b8fb9adccebb82461e99c5a678cc31e799176d3860e6110c46523e"
+
+test hmac_256_512_rfc4231 = mac(HS256, secret(bytes((0..20).map(i => 11))), "Hi There").hex == "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7" and mac(HS512, secret(bytes((0..20).map(i => 11))), "Hi There").hex == "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854"
+
+// ---------- tests: JSON ----------
+
+test json_values = parse_json(" [ -0, 1.5e+3, \"\\u00e9\\n\", false ] ") == ok(JArr{items: [JNum{text: "-0"}, JNum{text: "1.5e+3"}, JStr{value: "é\n"}, JBool{value: false}]}) and parse_json("\"\\ud83d\\ude00\"") == ok(JStr{value: "😀"}) and parse_json("\{}") == ok(JObj{fields: []}) and parse_json("[]") == ok(JArr{items: []}) and parse_json("\{\"a\":\{\"b\":[[]]}}").is_ok
+test json_rejects = ["", " ", "[1,]", "[,1]", "\{\"a\"}", "\{\"a\":}", "\{\"a\":1,}", "\{1:2}", "01", "1.", ".5", "+1", "tru", "nul", "[1 2]", "\"abc", "\"a\\x\"", "\"\\ud83d\"", "\"\\ude00\"", "\"\\u12\"", "[1]]", "\{\"a\":1}x", "'a'", "NaN", "[\"a\tb\"]", "\{\"a\":1 \"b\":2}", "]", "\{]", "[}"].all(s => parse_json(s).is_err)
+test json_depth = parse_json("[".repeat(32) + "]".repeat(32)).is_ok and parse_json("[".repeat(33) + "]".repeat(33)) == err("nested too deep")
+test json_duplicates = parse_json("\{\"a\":1,\"b\":\{\"a\":2}}").is_ok and parse_json("\{\"a\":1,\"\\u0061\":2}") == err("duplicate member a")
+test json_round_trip = ["\{\"a\":\"x\\\"y\\\\z\\n\",\"b\":[1,true,null,\{}]}", "[\"é😀\",-1.5e3]"].all(s => parse_json(s).map(json_text) == ok(s)) and json_text(JStr{value: from_codes([1]).or("")}) == "\"\\u0001\""
+test json_helpers = member(JObj{fields: [("a", jint(1))]}, "a") == some(jint(1)) and member(jint(1), "a") == none and json_int(JNum{text: "1300819380"}) == some(1300819380) and json_int(JNum{text: "1300819380.75"}) == some(1300819380) and json_int(JNum{text: "1e3"}) == some(1000) and json_int(JNum{text: "1e300"}) == none and json_int(JNum{text: "99999999999999999999"}) == none and json_int(jstr("1")) == none and jstr("q") == JStr{value: "q"}
+
+// ---------- tests: keys and JWS ----------
+
+fn failed[T](r: Res[T, JwtErr]) -> Opt[JwtErr]
+= match r
+  | ok(_) => none
+  | err(e) => some(e)
+
+fn kind[T](r: Res[T, JwtErr]) -> Str
+= match r
+  | ok(_) => "ok"
+  | err(e) => e.str.split("\{").first.or("")
+
+fn a1_key() -> Key
+= hmac_key(HS256, secret(from_b64url("AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow").or(bytes([])))).or(generate_ed25519_key_free())
+
+fn generate_ed25519_key_free() -> Key
+= EdVerifyingKey{kid: none, x: bytes([])}
+
+fn a1_token() -> Str
+= "eyJ0eXAiOiJKV1QiLA0KICJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+fn ed_key() -> Key
+= ed25519_signing_key(secret(from_b64url("nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A").or(bytes([])))).or(generate_ed25519_key_free())
+
+fn ed_token() -> Str
+= "eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc.hgyY0il_MGCjP0JzlnLWG1PPOt7-09PGcvMg3AIbQR6dWbhijcNR4ki4iylGjg5BhVsPt9g7sVvpAr_MuM0KAg"
+
+fn hk(alg: Alg, n: Int) -> Key
+= hmac_key(alg, secret(bytes((0..n).map(i => i % 256)))).or(generate_ed25519_key_free())
+
+test rfc7515_a1_exact = sign_compact(a1_key(), "\{\"typ\":\"JWT\",\r\n \"alg\":\"HS256\"}", "\{\"iss\":\"joe\",\r\n \"exp\":1300819380,\r\n \"http://example.com/is_root\":true}") == ok(a1_token())
+test rfc7519_verify = match verify(a1_token(), [a1_key()], policy([HS256]) with issuers := ["joe"], 1300819379)
+  | ok(t) => t.claims == (claims() with iss := some("joe"), exp := some(1300819380)) and claim_bool(t, "http://example.com/is_root") == some(true) and t.typ == some("JWT") and t.alg == HS256 and t.text.contains("is_root")
+  | err(_) => false
+test rfc7519_expired = verify(a1_token(), [a1_key()], policy([HS256]), 1300819380) == err(Expired{exp: 1300819380, now: 1300819380}) and verify(a1_token(), [a1_key()], policy([HS256]) with leeway := 60, 1300819439).is_ok and verify(a1_token(), [a1_key()], policy([HS256]) with leeway := 60, 1300819440).is_err
+test rfc8037_a4_exact = jws_sign(ed_key(), [], "Example of Ed25519 signing") == ok(ed_token()) and jws_verify(ed_token(), [ed_key()], policy([EdDSA])).map(j => j.payload) == ok("Example of Ed25519 signing")
+test rfc8037_keys = public_bytes(ed_key()).map(b64url) == some("11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo") and thumbprint(ed_key()) == some("kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k") and thumbprint(a1_key()) == none
+test rfc8037_verifying_only = match verifying_key(ed_key())
+  | some(v) => jws_verify(ed_token(), [v], policy([EdDSA])).is_ok and not can_sign(v) and jws_sign(v, [], "x") == err(InvalidKey{why: "a verifying key cannot sign"}) and verifying_key(v).is_some
+  | none => false
+
+test key_lengths = kind(hmac_key(HS256, secret(bytes((0..31).map(i => 1))))) == "InvalidKey" and hmac_key(HS256, secret(bytes((0..32).map(i => 1)))).is_ok and hmac_key(HS384, secret(bytes((0..47).map(i => 1)))).is_err and hmac_key(HS384, secret(bytes((0..48).map(i => 1)))).is_ok and hmac_key(HS512, secret(bytes((0..63).map(i => 1)))).is_err and kind(hmac_key(EdDSA, secret(bytes((0..64).map(i => 1))))) == "InvalidKey" and ed25519_signing_key(secret(bytes([1]))).is_err and ed25519_verifying_key(bytes([1])).is_err
+test key_info = key_alg(hk(HS384, 48)) == HS384 and key_alg(ed_key()) == EdDSA and key_id(with_kid(ed_key(), "k1")) == some("k1") and key_id(ed_key()) == none and can_sign(hk(HS256, 32)) and verifying_key(hk(HS256, 32)).is_none and public_bytes(hk(HS256, 32)).is_none
+test generated = do
+  h = generate_hmac_key(HS512)
+  e = generate_ed25519_key()
+  match h
+  | ok(k) => sign(k, claims(), []).map(t => verify(t, [k], policy([HS512]), 0).is_ok) == ok(true) and sign(e, claims(), []).map(t => verify(t, [e], policy([EdDSA]), 0).is_ok) == ok(true) and generate_hmac_key(EdDSA).is_err
+  | err(_) => false
+
+test alg_names = all_algs().all(a => alg_of(alg_name(a)) == some(a)) and alg_of("none") == none and alg_of("RS256") == none and alg_of("HS256 ") == none
+
+fn forge(header: Str, payload: Str, sig: Str) -> Str
+= b64url(header.to_bytes) + "." + b64url(payload.to_bytes) + "." + sig
+
+test rejects_none = ["none", "None", "NONE", "nOnE"].all(a => verify(forge("\{\"alg\":\"{a}\"}", "\{}", "AAAA"), [hk(HS256, 32)], policy(all_algs()), 0) == err(UnsupportedAlg{alg: a})) and verify(b64url("\{\"alg\":\"none\"}".to_bytes) + "." + b64url("\{}".to_bytes) + ".", [hk(HS256, 32)], policy(all_algs()), 0) == err(UnsupportedAlg{alg: "none"}) and verify(b64url("\{\"alg\":\"HS256\"}".to_bytes) + "." + b64url("\{}".to_bytes) + ".", [hk(HS256, 32)], policy(all_algs()), 0) == err(Malformed{why: "empty signature"})
+test rejects_unknown_alg = verify(forge("\{\"alg\":\"RS256\"}", "\{}", "AAAA"), [hk(HS256, 32)], policy(all_algs()), 0) == err(UnsupportedAlg{alg: "RS256"}) and verify(forge("\{\"alg\":1}", "\{}", "AAAA"), [hk(HS256, 32)], policy(all_algs()), 0) == err(Malformed{why: "alg must be a string"}) and verify(forge("\{}", "\{}", "AAAA"), [hk(HS256, 32)], policy(all_algs()), 0) == err(Malformed{why: "the header has no alg"})
+
+test algorithm_confusion = do
+  ed = ed_key()
+  pub_x = public_bytes(ed).or(bytes([]))
+  hmac_from_public = hmac_key(HS256, secret(pub_x)).or(hk(HS256, 32))
+  forged = sign(hmac_from_public, claims(), []).or("")
+  ed_tok = sign(ed, claims(), []).or("")
+  verify(forged, [ed], policy(all_algs()), 0) == err(NoKey{kid: none}) and verify(ed_tok, [hk(HS256, 32)], policy(all_algs()), 0) == err(NoKey{kid: none}) and verify(ed_tok, [ed], policy([HS256]), 0) == err(AlgNotAllowed{alg: "EdDSA"})
+
+test hs_all = [(HS256, 32), (HS384, 48), (HS512, 64)].all(p => do
+  k = hk(p.0, p.1)
+  t = sign(k, claims() with sub := some("u"), []).or("")
+  verify(t, [k], policy([p.0]), 0).map(x => x.claims.sub) == ok(some("u")) and verify(t, [hk(p.0, p.1 + 1)], policy([p.0]), 0) == err(BadSignature))
+
+test hs384_header = sign(hk(HS384, 48), claims(), []).map(t => t.starts_with(b64url("\{\"alg\":\"HS384\",\"typ\":\"JWT\"}".to_bytes) + ".")) == ok(true)
+
+test kid_selection = do
+  k1 = with_kid(hk(HS256, 32), "one")
+  k2 = with_kid(hk(HS256, 40), "two")
+  t2 = sign(k2, claims(), []).or("")
+  plain = sign(hk(HS256, 40), claims(), []).or("")
+  verify(t2, [k1, k2], policy([HS256]), 0).map(t => t.kid) == ok(some("two")) and verify(t2, [k1], policy([HS256]), 0) == err(NoKey{kid: some("two")}) and verify(plain, [k1, k2], policy([HS256]), 0).is_ok and select_keys([k1, k2, ed_key()], some("one"), HS256).len == 1 and select_keys([k1, k2, ed_key()], none, EdDSA).len == 1
+
+test tampering = do
+  k = hk(HS256, 32)
+  t = sign(k, claims() with sub := some("alice"), []).or("")
+  parts = t.split(".")
+  evil = parts[0] + "." + b64url("\{\"sub\":\"admin\"}".to_bytes) + "." + parts[2]
+  verify(evil, [k], policy([HS256]), 0) == err(BadSignature) and verify(parts[0] + "." + parts[1] + "." + parts[2].drop(2), [k], policy([HS256]), 0).is_err and verify(t + "A", [k], policy([HS256]), 0).is_err
+
+test strict_base64 = do
+  k = hk(HS256, 32)
+  t = sign(k, claims(), []).or("")
+  parts = t.split(".")
+  kind(verify(parts[0] + "=." + parts[1] + "." + parts[2], [k], policy([HS256]), 0)) == "Malformed" and kind(verify(parts[0] + "." + parts[1] + "." + parts[2] + "==", [k], policy([HS256]), 0)) == "Malformed" and kind(verify(parts[0].replace("e", "+") + "." + parts[1] + "." + parts[2], [k], policy([HS256]), 0)) == "Malformed" and kind(verify(" " + t, [k], policy([HS256]), 0)) == "Malformed" and from_b64url("a") == none and from_b64url("YQ=") == none and b64url(bytes([255, 254])) == "__4"
+
+test structure = ["", "a", "a.b", "a.b.c.d", "..", "a..", "..c"].all(s => kind(verify(s, [hk(HS256, 32)], policy([HS256]), 0)) == "Malformed") and verify("a.b.c.d.e", [hk(HS256, 32)], policy([HS256]), 0) == err(Malformed{why: "encrypted tokens (JWE) are not supported"})
+test size_limit = verify("a".repeat(9000), [hk(HS256, 32)], policy([HS256]), 0) == err(TooLarge{len: 9000, max: 8192}) and verify("a".repeat(100), [hk(HS256, 32)], policy([HS256]) with max_len := 50, 0) == err(TooLarge{len: 100, max: 50})
+test header_must_be_object = kind(verify(forge("[\"alg\"]", "\{}", "AAAA"), [hk(HS256, 32)], policy([HS256]), 0)) == "Malformed" and kind(verify(forge("\{\"alg\":\"HS256\",\"alg\":\"none\"}", "\{}", "AAAA"), [hk(HS256, 32)], policy([HS256]), 0)) == "Malformed" and verify(forge("\{\"alg\":\"HS256\",\"kid\":5}", "\{}", "AAAA"), [hk(HS256, 32)], policy([HS256]), 0) == err(Malformed{why: "kid must be a string"})
+
+test payload_must_be_claims = do
+  k = hk(HS256, 32)
+  bad_payloads = ["[1]", "\"x\"", "not json", "\{\"exp\":\"tomorrow\"}", "\{\"aud\":[1]}", "\{\"iss\":7}", "\{\"a\":1,\"a\":2}"]
+  bad_payloads.all(p => verify(jws_sign(k, [("typ", jstr("JWT"))], p).or(""), [k], policy([HS256]), 0).is_err) and verify(jws_sign(k, [], "\{\"exp\":\"x\"}").or(""), [k], policy([HS256]), 0) == err(BadClaim{name: "exp", why: "must be a NumericDate (seconds since the epoch)"})
+
+fn crit_token(k: Key, h: Str) -> Str
+= sign_compact(k, h, "\{}").or("")
+
+test critical_headers = do
+  k = hk(HS256, 32)
+  known = crit_token(k, "\{\"alg\":\"HS256\",\"crit\":[\"exp_ext\"],\"exp_ext\":1}")
+  verify(known, [k], policy([HS256]), 0) == err(UnknownCritical{name: "exp_ext"}) and verify(known, [k], policy([HS256]) with critical := ["exp_ext"], 0).is_ok and verify(crit_token(k, "\{\"alg\":\"HS256\",\"crit\":[\"x\"]}"), [k], policy([HS256]) with critical := ["x"], 0) == err(UnknownCritical{name: "x"}) and kind(verify(crit_token(k, "\{\"alg\":\"HS256\",\"crit\":[]}"), [k], policy([HS256]), 0)) == "Malformed" and kind(verify(crit_token(k, "\{\"alg\":\"HS256\",\"crit\":[\"alg\"]}"), [k], policy([HS256]), 0)) == "Malformed" and kind(verify(crit_token(k, "\{\"alg\":\"HS256\",\"crit\":\"x\"}"), [k], policy([HS256]), 0)) == "Malformed"
+
+test unencoded_payload = verify(crit_token(hk(HS256, 32), "\{\"alg\":\"HS256\",\"b64\":false,\"crit\":[\"b64\"]}"), [hk(HS256, 32)], policy([HS256]) with critical := ["b64"], 0) == err(Malformed{why: "unencoded payloads (b64: false) are not supported"})
+
+test sign_compact_checks = kind(sign_compact(hk(HS256, 32), "\{\"alg\":\"HS512\"}", "x")) == "InvalidKey" and kind(sign_compact(hk(HS256, 32), "nope", "x")) == "Malformed" and kind(sign_compact(hk(HS256, 32), "[\"alg\"]", "x")) == "Malformed" and sign_compact(hk(HS256, 32), "\{\"alg\":\"none\"}", "x") == err(UnsupportedAlg{alg: "none"})
+test jws_sign_checks = kind(jws_sign(hk(HS256, 32), [("alg", jstr("none"))], "x")) == "Malformed" and kind(jws_sign(hk(HS256, 32), [("cty", jstr("a")), ("cty", jstr("b"))], "x")) == "Malformed" and jws_sign(with_kid(hk(HS256, 32), "k"), [("cty", jstr("text"))], "x").map(t => decode_unverified(t, 8192).map(j => json_text(j.header))) == ok(ok("\{\"alg\":\"HS256\",\"kid\":\"k\",\"cty\":\"text\"}"))
+test bypassed_constructor = kind(sign(HmacKey{alg: HS256, kid: none, mac_key: secret(bytes([1]))}, claims(), [])) == "InvalidKey" and verify(sign(hk(HS256, 32), claims(), []).or(""), [HmacKey{alg: HS256, kid: none, mac_key: secret(bytes([1]))}], policy([HS256]), 0) == err(BadSignature) and kind(sign(HmacKey{alg: EdDSA, kid: none, mac_key: secret(bytes((0..64).map(i => 1)))}, claims(), [])) == "InvalidKey"
+
+test unverified_decoding = do
+  t = sign(with_kid(ed_key(), "ed1"), claims() with iss := some("me"), []).or("")
+  decode_unverified(t, 8192).map(j => (j.alg, j.kid)) == ok((EdDSA, some("ed1"))) and decode_jwt_unverified(t, 8192).map(x => x.claims.iss) == ok(some("me")) and kind(decode_unverified(t, 10)) == "TooLarge" and kind(decode_jwt_unverified(ed_token(), 8192)) == "Malformed"
+
+// ---------- tests: claims ----------
+
+fn ck() -> Key
+= hk(HS256, 32)
+
+fn tok(c: Claims, extra: List[(Str, JsonValue)]) -> Str
+= sign(ck(), c, extra).or("")
+
+fn at(c: Claims, p: Policy, now: Int) -> Res[Token, JwtErr]
+= verify(tok(c, []), [ck()], p, now)
+
+fn hp() -> Policy
+= policy([HS256])
+
+test exp_rules = at(claims() with exp := some(100), hp(), 99).is_ok and at(claims() with exp := some(100), hp(), 100) == err(Expired{exp: 100, now: 100}) and at(claims() with exp := some(100), hp() with leeway := 5, 104).is_ok and at(claims() with exp := some(100), hp() with leeway := 5, 105) == err(Expired{exp: 100, now: 105})
+test nbf_rules = at(claims() with nbf := some(100), hp(), 100).is_ok and at(claims() with nbf := some(100), hp(), 99) == err(NotYetValid{nbf: 100, now: 99}) and at(claims() with nbf := some(100), hp() with leeway := 1, 99).is_ok
+test iat_rules = at(claims() with iat := some(100), hp(), 100).is_ok and at(claims() with iat := some(101), hp(), 100) == err(IssuedInFuture{iat: 101, now: 100}) and at(claims() with iat := some(101), hp() with leeway := 1, 100).is_ok
+test max_age_rules = at(claims() with iat := some(100), hp() with max_age := some(60), 160).is_ok and at(claims() with iat := some(100), hp() with max_age := some(60), 161) == err(IssuedTooLongAgo{iat: 100, max_age: 60}) and at(claims(), hp() with max_age := some(60), 0) == err(MissingClaim{name: "iat"})
+test issuer_rules = at(claims() with iss := some("a"), hp() with issuers := ["a", "b"], 0).is_ok and at(claims() with iss := some("c"), hp() with issuers := ["a"], 0) == err(WrongIssuer{iss: some("c")}) and at(claims(), hp() with issuers := ["a"], 0) == err(WrongIssuer{iss: none}) and at(claims() with iss := some("c"), hp(), 0).is_ok
+test audience_rules = at(claims() with aud := ["x", "api"], hp() with audiences := ["api"], 0).is_ok and at(claims() with aud := ["api"], hp() with audiences := ["api"], 0).is_ok and at(claims() with aud := ["web"], hp() with audiences := ["api"], 0) == err(WrongAudience{aud: ["web"]}) and at(claims(), hp() with audiences := ["api"], 0) == err(WrongAudience{aud: []})
+test subject_rules = at(claims() with sub := some("u1"), hp() with subject := some("u1"), 0).is_ok and at(claims() with sub := some("u2"), hp() with subject := some("u1"), 0) == err(WrongSubject{sub: some("u2")})
+test required_rules = at(claims() with jti := some("j"), hp() with required := ["jti"], 0).is_ok and at(claims(), hp() with required := ["jti"], 0) == err(MissingClaim{name: "jti"}) and verify(tok(claims(), [("scope", jstr("a b"))]), [ck()], hp() with required := ["scope"], 0).is_ok
+test typ_rules = at(claims(), hp() with typ := some("jwt"), 0).is_ok and at(claims(), hp() with typ := some("application/JWT"), 0).is_ok and at(claims(), hp() with typ := some("at+jwt"), 0) == err(WrongType{typ: some("JWT")}) and verify(jws_sign(ck(), [], "\{}").or(""), [ck()], hp() with typ := some("JWT"), 0) == err(WrongType{typ: none}) and verify(jws_sign(ck(), [("typ", jint(1))], "\{}").or(""), [ck()], hp(), 0) == err(Malformed{why: "typ must be a string"})
+test fractional_dates = verify(jws_sign(ck(), [], "\{\"exp\":100.9}").or(""), [ck()], hp(), 99).map(t => t.claims.exp) == ok(some(100))
+test aud_string_or_array = verify(jws_sign(ck(), [], "\{\"aud\":\"a\"}").or(""), [ck()], hp(), 0).map(t => t.claims.aud) == ok(["a"]) and verify(jws_sign(ck(), [], "\{\"aud\":[]}").or(""), [ck()], hp(), 0).map(t => t.claims.aud) == ok([]) and kind(verify(jws_sign(ck(), [], "\{\"aud\":5}").or(""), [ck()], hp(), 0)) == "BadClaim"
+test claims_json_cases = claims_json(claims() with aud := ["a", "b"], exp := some(5), []).map(json_text) == ok("\{\"aud\":[\"a\",\"b\"],\"exp\":5}") and kind(claims_json(claims() with sub := some("u"), [("sub", jstr("v"))])) == "Malformed" and kind(claims_json(claims(), [("a", jint(1)), ("a", jint(2))])) == "Malformed" and claims_json(claims(), []).map(json_text) == ok("\{}")
+test claims_of_cases = kind(claims_of(jint(1))) == "Malformed" and claims_of(JObj{fields: [("iat", JNum{text: "7"})]}) == ok(claims() with iat := some(7)) and claims_of(JObj{fields: [("jti", jint(7))]}) == err(BadClaim{name: "jti", why: "must be a string"})
+test check_claims_direct = match decode_jwt_unverified(tok(claims() with exp := some(10), []), 8192)
+  | ok(t) => check_claims(t, hp(), 5).is_ok and check_claims(t, hp(), 10) == err(Expired{exp: 10, now: 10})
+  | err(_) => false
+
+type Custom = {sub: Str, roles: List[Str], admin: Bool}
+
+test custom_claims = do
+  t = tok(claims() with sub := some("u7"), [("roles", JArr{items: [jstr("a"), jstr("b")]}), ("admin", JBool{value: false}), ("n", jint(42)), ("scope", jstr("read  write"))])
+  match verify(t, [ck()], hp(), 0)
+  | ok(v) => json.decode[Custom](v.text) == ok(Custom{sub: "u7", roles: ["a", "b"], admin: false}) and claim_strs(v, "roles") == some(["a", "b"]) and claim_strs(v, "scope") == some(["read", "write"]) and claim_strs(v, "sub") == some(["u7"]) and claim_strs(v, "n") == none and claim_int(v, "n") == some(42) and claim_int(v, "sub") == none and claim_bool(v, "admin") == some(false) and claim_str(v, "sub") == some("u7") and claim_str(v, "nope") == none and claim(v, "n") == some(jint(42))
+  | err(_) => false
+
+test sign_payload_cases = do
+  p = json.encode(Custom{sub: "x", roles: [], admin: true})
+  match sign_payload(ck(), p)
+  | ok(t) => verify(t, [ck()], hp(), 0).map(v => v.text) == ok(p) and kind(sign_payload(ck(), "[1]")) == "Malformed" and kind(sign_payload(ck(), "\{\"exp\":\"x\"}")) == "BadClaim"
+  | err(_) => false
+
+test clock = verify_now(tok(claims() with exp := some(4000000000), []), [ck()], hp()).is_ok and kind(verify_now(tok(claims() with exp := some(1000), []), [ck()], hp())) == "Expired"
+
+fn rq(headers: List[(Str, Str)]) -> Request
+= Request{method: "GET", url: "/", headers, body: "", timeout_ms: 0, retries: 0, redirects: 0}
+
+test bearer = bearer_token(rq([("Authorization", "Bearer abc.def.ghi")])) == some("abc.def.ghi") and bearer_token(rq([("authorization", "bearer  t ")])) == some("t") and bearer_token(rq([("authorization", "Basic x")])) == none and bearer_token(rq([("authorization", "Bearer ")])) == none and bearer_token(rq([])) == none
+
+test policy_defaults = policy([EdDSA]) == Policy{algs: [EdDSA], leeway: 0, max_age: none, issuers: [], audiences: [], subject: none, typ: none, required: [], critical: [], max_len: 8192}
+
+// ---------- tests: JWK sets ----------
+
+fn rfc8037_jwk() -> Str
+= "\{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"d\":\"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}"
+
+fn rfc8037_public() -> Str
+= "\{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}"
+
+fn set(keys: List[Str]) -> Str
+= "\{\"keys\":[" + keys.join(",") + "]}"
+
+test jwk_rfc8037 = match parse_jwk(rfc8037_jwk())
+  | ok(some(k)) => can_sign(k) and jws_sign(k, [], "Example of Ed25519 signing") == ok(ed_token())
+  | _ => false
+
+test jwks_public_set = match parse_jwks(set([rfc8037_public().replace("}", ",\"kid\":\"ed1\",\"use\":\"sig\",\"alg\":\"EdDSA\"}"), "\{\"kty\":\"RSA\",\"n\":\"AQAB\",\"e\":\"AQAB\",\"kid\":\"r1\"}", "\{\"kty\":\"OKP\",\"crv\":\"X25519\",\"x\":\"AAAA\"}", rfc8037_public().replace("}", ",\"use\":\"enc\"}")]))
+  | ok(ks) => ks.len == 1 and key_id(ks[0]) == some("ed1") and not can_sign(ks[0]) and jws_verify(ed_token(), ks, policy([EdDSA])).is_ok
+  | err(_) => false
+
+test jwks_refuses_private = failed(parse_jwks(set([rfc8037_jwk()]))) == some(BadJwks{why: "a public key set contains a private key (d)"}) and failed(parse_jwks(set(["\{\"kty\":\"oct\",\"k\":\"AAAA\",\"alg\":\"HS256\"}"]))) == some(BadJwks{why: "a public key set contains a symmetric (oct) key"})
+
+test jwks_private_set = do
+  k64 = b64url(bytes((0..32).map(i => i)))
+  match parse_private_jwks(set([rfc8037_jwk(), "\{\"kty\":\"oct\",\"kid\":\"h\",\"alg\":\"HS256\",\"k\":\"{k64}\"}"]))
+  | ok(ks) => ks.len == 2 and key_alg(ks[1]) == HS256 and key_id(ks[1]) == some("h") and verify(sign(ks[1], claims(), []).or(""), [with_kid(hk(HS256, 32), "h")], hp(), 0).is_ok
+  | err(_) => false
+
+test jwks_errors = kind(parse_jwks("[]")) == "BadJwks" and kind(parse_jwks("nope")) == "BadJwks" and kind(parse_jwks(set(["1"]))) == "BadJwks" and failed(parse_jwks(set(["\{\"crv\":\"Ed25519\"}"]))) == some(BadJwks{why: "a key has no kty"}) and failed(parse_jwks(set(["\{\"kty\":\"OKP\",\"crv\":\"Ed25519\"}"]))) == some(BadJwks{why: "an OKP key needs x"}) and kind(parse_jwks(set(["\{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"AAAA\"}"]))) == "InvalidKey" and kind(parse_jwks(set(["\{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo=\"}"]))) == "BadJwks" and kind(parse_jwks(set([rfc8037_public().replace("}", ",\"alg\":\"HS256\"}")]))) == "BadJwks" and kind(parse_private_jwks(set(["\{\"kty\":\"oct\",\"k\":\"AAAA\"}"]))) == "BadJwks" and kind(parse_private_jwks(set(["\{\"kty\":\"oct\",\"k\":\"AAAA\",\"alg\":\"HS256\"}"]))) == "InvalidKey" and kind(parse_private_jwks(set([rfc8037_jwk().replace("11qY", "21qY")]))) == "BadJwks" and kind(parse_jwks(set([rfc8037_public().replace("}", ",\"kid\":7}")]))) == "BadJwks"
+test jwks_key_ops = parse_jwks(set([rfc8037_public().replace("}", ",\"key_ops\":[\"verify\"]}")])).map(ks => ks.len) == ok(1) and parse_jwks(set([rfc8037_public().replace("}", ",\"key_ops\":[\"encrypt\"]}")])).map(ks => ks.len) == ok(0) and parse_jwk("\{\"kty\":\"EC\"}").map(_.is_none) == ok(true) and kind(parse_jwk("x")) == "BadJwks"
+
+test publishing_keys = do
+  k = with_kid(ed_key(), "ed1")
+  text = public_jwks([k, hk(HS256, 32)])
+  text == "\{\"keys\":[\{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\",\"kid\":\"ed1\",\"alg\":\"EdDSA\",\"use\":\"sig\"}]}" and parse_jwks(text).map(ks => ks.map(key_id)) == ok([some("ed1")]) and public_jwk(hk(HS256, 32)) == none and public_jwk(ed_key()).map(j => member(j, "d")) == some(none)

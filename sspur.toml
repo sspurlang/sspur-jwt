@@ -1,0 +1,5 @@
+[package]
+name = "jwt"
+version = "0.1.0"
+description = "JSON Web Tokens and JWS: HS256, HS384, HS512 and EdDSA, strict parsing, claim validation with leeway, typed keys bound to one algorithm, and JWKS"
+license = "MIT"
