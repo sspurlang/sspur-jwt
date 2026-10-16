@@ -377,25 +377,22 @@ fn hmac_size(a: Alg) -> Int
 // has hand-written `Eq` (secrets compared in constant time) and `Show` (secrets shown as
 // `<secret>`) instead of derived ones. Build keys with `hmac_key`, `ed25519_signing_key` and
 // `ed25519_verifying_key`, which check them.
-pub type Key = HmacKey{alg: Alg, kid: Opt[Str], mac_key: Secret[Bytes]} | EdSigningKey{kid: Opt[Str], seed: Secret[Bytes], x: Bytes} | EdVerifyingKey{kid: Opt[Str], x: Bytes}
+pub type Key = HmacKey{alg: Alg, kid: Opt[Str], mac_key: KeyBytes} | EdSigningKey{kid: Opt[Str], seed: KeyBytes, x: Bytes} | EdVerifyingKey{kid: Opt[Str], x: Bytes} derive Eq, Show
 
-// Keys print with their secrets hidden: `HmacKey{alg: HS256, kid: none, mac_key: <secret>}`.
-pub impl Show for Key
-  fn show(k: Key) -> Str
-  = match k
-    | HmacKey{alg, kid} => "HmacKey\{alg: {alg}, kid: {kid}, mac_key: <secret>}"
-    | EdSigningKey{kid, x} => "EdSigningKey\{kid: {kid}, seed: <secret>, x: {x}}"
-    | EdVerifyingKey{kid, x} => "EdVerifyingKey\{kid: {kid}, x: {x}}"
+// Secret key material, so keys can derive `Eq` and `Show`: it prints as `<secret>` (a `Key`
+// shows it as `KeyBytes(<secret>)`), and two `KeyBytes` compare in constant time. Unwrap with
+// `.raw`.
+pub type KeyBytes = new Secret[Bytes]
 
-// Keys are equal when they are the same kind with the same algorithm, key id and key material;
-// secrets are compared in constant time.
-pub impl Eq for Key
-  fn eq(a: Key, b: Key) -> Bool
-  = match (a, b)
-    | (HmacKey{alg, kid, mac_key}, HmacKey{alg: alg2, kid: kid2, mac_key: k2}) => alg == alg2 and kid == kid2 and mac_key.check(x => k2.check(y => crypto.equal(x, y)))
-    | (EdSigningKey{kid, seed, x}, EdSigningKey{kid: kid2, seed: s2, x: x2}) => kid == kid2 and x == x2 and seed.check(p => s2.check(q => crypto.equal(p, q)))
-    | (EdVerifyingKey{kid, x}, EdVerifyingKey{kid: kid2, x: x2}) => kid == kid2 and x == x2
-    | _ => false
+// Equal when the bytes are, compared in constant time.
+pub impl Eq for KeyBytes
+  fn eq(a: KeyBytes, b: KeyBytes) -> Bool
+  = a.raw.check(x => b.raw.check(y => crypto.equal(x, y)))
+
+// Always `<secret>`.
+pub impl Show for KeyBytes
+  fn show(k: KeyBytes) -> Str
+  = "<secret>"
 
 fn hmac_ok(alg: Alg, k: Secret[Bytes]) -> Bool
 = hmac_size(alg) > 0 and k.check(b => b.len >= hmac_size(alg))
@@ -403,11 +400,11 @@ fn hmac_ok(alg: Alg, k: Secret[Bytes]) -> Bool
 // An HMAC key for `alg` (HS256, HS384 or HS512). RFC 7518 section 3.2 requires a key at least as
 // long as the hash: 32, 48 or 64 bytes.
 pub fn hmac_key(alg: Alg, k: Secret[Bytes]) -> Res[Key, JwtErr]
-= if hmac_size(alg) == 0 then err(InvalidKey{why: "{alg_name(alg)} is not an HMAC algorithm"}) else if hmac_ok(alg, k) then ok(HmacKey{alg, kid: none, mac_key: k}) else err(InvalidKey{why: "an {alg_name(alg)} key must be at least {hmac_size(alg)} bytes"})
+= if hmac_size(alg) == 0 then err(InvalidKey{why: "{alg_name(alg)} is not an HMAC algorithm"}) else if hmac_ok(alg, k) then ok(HmacKey{alg, kid: none, mac_key: KeyBytes(k)}) else err(InvalidKey{why: "an {alg_name(alg)} key must be at least {hmac_size(alg)} bytes"})
 
 // An Ed25519 signing key from its 32-byte secret seed (the JWK `d`).
 pub fn ed25519_signing_key(seed: Secret[Bytes]) -> Res[Key, JwtErr]
-= if seed.check(b => b.len == 32) then ok(EdSigningKey{kid: none, seed, x: crypto.public_key(seed)}) else err(InvalidKey{why: "an Ed25519 seed must be 32 bytes"})
+= if seed.check(b => b.len == 32) then ok(EdSigningKey{kid: none, seed: KeyBytes(seed), x: crypto.public_key(seed)}) else err(InvalidKey{why: "an Ed25519 seed must be 32 bytes"})
 
 // An Ed25519 verifying key from its 32-byte public key (the JWK `x`).
 pub fn ed25519_verifying_key(x: Bytes) -> Res[Key, JwtErr]
@@ -421,7 +418,7 @@ pub fn generate_hmac_key(alg: Alg) -> Res[Key, JwtErr] ! rand
 pub fn generate_ed25519_key() -> Key ! rand
 = do
   (sk, pk) = crypto.keypair()
-  EdSigningKey{kid: none, seed: sk, x: pk}
+  EdSigningKey{kid: none, seed: KeyBytes(sk), x: pk}
 
 // `k` with the key id `kid`.
 pub fn with_kid(k: Key, kid: Str where _.len > 0) -> Key
@@ -474,13 +471,13 @@ fn mac(alg: Alg, k: Secret[Bytes], data: Str) -> Bytes
 
 fn signature(k: Key, input: Str) -> Res[Bytes, JwtErr]
 = match k
-  | HmacKey{alg, mac_key} => if hmac_ok(alg, mac_key) then ok(mac(alg, mac_key, input)) else err(InvalidKey{why: "an {alg_name(alg)} key must be at least {hmac_size(alg)} bytes"})
-  | EdSigningKey{seed} => if seed.check(b => b.len == 32) then ok(crypto.sign(seed, input)) else err(InvalidKey{why: "an Ed25519 seed must be 32 bytes"})
+  | HmacKey{alg, mac_key} => if hmac_ok(alg, mac_key.raw) then ok(mac(alg, mac_key.raw, input)) else err(InvalidKey{why: "an {alg_name(alg)} key must be at least {hmac_size(alg)} bytes"})
+  | EdSigningKey{seed} => if seed.raw.check(b => b.len == 32) then ok(crypto.sign(seed.raw, input)) else err(InvalidKey{why: "an Ed25519 seed must be 32 bytes"})
   | EdVerifyingKey => err(InvalidKey{why: "a verifying key cannot sign"})
 
 fn signature_ok(k: Key, input: Str, sig: Bytes) -> Bool
 = match k
-  | HmacKey{alg, mac_key} => hmac_ok(alg, mac_key) and crypto.equal(mac(alg, mac_key, input), sig)
+  | HmacKey{alg, mac_key} => hmac_ok(alg, mac_key.raw) and crypto.equal(mac(alg, mac_key.raw, input), sig)
   | EdSigningKey{x} => x.len == 32 and sig.len == 64 and crypto.verify(x, input, sig)
   | EdVerifyingKey{x} => x.len == 32 and sig.len == 64 and crypto.verify(x, input, sig)
 
@@ -1013,8 +1010,8 @@ test rfc8037_verifying_only = match verifying_key(ed_key())
   | none => false
 
 test key_lengths = kind(hmac_key(HS256, secret(bytes((0..31).map(i => 1))))) == "InvalidKey" and hmac_key(HS256, secret(bytes((0..32).map(i => 1)))).is_ok and hmac_key(HS384, secret(bytes((0..47).map(i => 1)))).is_err and hmac_key(HS384, secret(bytes((0..48).map(i => 1)))).is_ok and hmac_key(HS512, secret(bytes((0..63).map(i => 1)))).is_err and kind(hmac_key(EdDSA, secret(bytes((0..64).map(i => 1))))) == "InvalidKey" and ed25519_signing_key(secret(bytes([1]))).is_err and ed25519_verifying_key(bytes([1])).is_err
-test key_equality = hk(HS256, 32) == hk(HS256, 32) and hk(HS256, 32) != hk(HS256, 33) and hk(HS256, 64) != hk(HS512, 64) and with_kid(hk(HS256, 32), "a") != hk(HS256, 32) and ed_key() == ed_key() and verifying_key(ed_key()).map(v => v == EdVerifyingKey{kid: none, x: public_bytes(ed_key()).or(bytes([]))}) == some(true) and ed_key() != generate_ed25519_key_free()
-test key_show = hk(HS256, 32).show == "HmacKey\{alg: HS256, kid: none, mac_key: <secret>}" and with_kid(ed_key(), "e").show.starts_with("EdSigningKey\{kid: some(\"e\"), seed: <secret>, x: 0xd75a98") and generate_ed25519_key_free().show == "EdVerifyingKey\{kid: none, x: 0x}"
+test key_equality = hk(HS256, 32) == hk(HS256, 32) and hk(HS256, 32) != hk(HS256, 33) and hk(HS256, 64) != hk(HS512, 64) and with_kid(hk(HS256, 32), "a") != hk(HS256, 32) and ed_key() == ed_key() and verifying_key(ed_key()) == some(EdVerifyingKey{kid: none, x: public_bytes(ed_key()).or(bytes([]))}) and ed_key() != generate_ed25519_key_free()
+test key_show = hk(HS256, 32).show == "HmacKey\{alg: HS256, kid: none, mac_key: KeyBytes(<secret>)}" and KeyBytes(secret(bytes([1]))).show == "<secret>" and KeyBytes(secret(bytes([1]))) == KeyBytes(secret(bytes([1]))) and KeyBytes(secret(bytes([1]))) != KeyBytes(secret(bytes([2]))) and with_kid(ed_key(), "e").show.starts_with("EdSigningKey\{kid: some(\"e\"), seed: KeyBytes(<secret>), x: 0xd75a98") and generate_ed25519_key_free().show == "EdVerifyingKey\{kid: none, x: 0x}"
 test key_info = key_alg(hk(HS384, 48)) == HS384 and key_alg(ed_key()) == EdDSA and key_id(with_kid(ed_key(), "k1")) == some("k1") and key_id(ed_key()) == none and can_sign(hk(HS256, 32)) and verifying_key(hk(HS256, 32)).is_none and public_bytes(hk(HS256, 32)).is_none
 test generated = do
   h = generate_hmac_key(HS512)
@@ -1087,7 +1084,7 @@ test unencoded_payload = verify(crit_token(hk(HS256, 32), "\{\"alg\":\"HS256\",\
 
 test sign_compact_checks = kind(sign_compact(hk(HS256, 32), "\{\"alg\":\"HS512\"}", "x")) == "InvalidKey" and kind(sign_compact(hk(HS256, 32), "nope", "x")) == "Malformed" and kind(sign_compact(hk(HS256, 32), "[\"alg\"]", "x")) == "Malformed" and sign_compact(hk(HS256, 32), "\{\"alg\":\"none\"}", "x") == err(UnsupportedAlg{alg: "none"})
 test jws_sign_checks = kind(jws_sign(hk(HS256, 32), [("alg", jstr("none"))], "x")) == "Malformed" and kind(jws_sign(hk(HS256, 32), [("cty", jstr("a")), ("cty", jstr("b"))], "x")) == "Malformed" and jws_sign(with_kid(hk(HS256, 32), "k"), [("cty", jstr("text"))], "x").map(t => decode_unverified(t, 8192).map(j => json_text(j.header))) == ok(ok("\{\"alg\":\"HS256\",\"kid\":\"k\",\"cty\":\"text\"}"))
-test bypassed_constructor = kind(sign(HmacKey{alg: HS256, kid: none, mac_key: secret(bytes([1]))}, claims(), [])) == "InvalidKey" and verify(sign(hk(HS256, 32), claims(), []).or(""), [HmacKey{alg: HS256, kid: none, mac_key: secret(bytes([1]))}], policy([HS256]), 0) == err(BadSignature) and kind(sign(HmacKey{alg: EdDSA, kid: none, mac_key: secret(bytes((0..64).map(i => 1)))}, claims(), [])) == "InvalidKey"
+test bypassed_constructor = kind(sign(HmacKey{alg: HS256, kid: none, mac_key: KeyBytes(secret(bytes([1])))}, claims(), [])) == "InvalidKey" and verify(sign(hk(HS256, 32), claims(), []).or(""), [HmacKey{alg: HS256, kid: none, mac_key: KeyBytes(secret(bytes([1])))}], policy([HS256]), 0) == err(BadSignature) and kind(sign(HmacKey{alg: EdDSA, kid: none, mac_key: KeyBytes(secret(bytes((0..64).map(i => 1))))}, claims(), [])) == "InvalidKey"
 
 test unverified_decoding = do
   t = sign(with_kid(ed_key(), "ed1"), claims() with iss := some("me"), []).or("")
